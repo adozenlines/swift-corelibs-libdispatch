@@ -49,6 +49,13 @@ enum {
 
 #define DISPATCH_QUEUE_FLAGS_MASK (DISPATCH_QUEUE_OVERCOMMIT)
 
+// On FreeBSD pthread_attr_t is a typedef to a pointer type
+#if defined(__FreeBSD__)
+#  define DISPATCH_QUEUE_NULLABLE_PTHREAD_ATTR_PTR _Nullable
+#else
+#  define DISPATCH_QUEUE_NULLABLE_PTHREAD_ATTR_PTR
+#endif
+
 /*!
  * @function dispatch_queue_attr_make_with_overcommit
  *
@@ -227,7 +234,7 @@ DISPATCH_EXPORT DISPATCH_MALLOC DISPATCH_RETURNS_RETAINED DISPATCH_WARN_RESULT
 DISPATCH_NOTHROW
 dispatch_queue_t
 dispatch_pthread_root_queue_create(const char *_Nullable label,
-	unsigned long flags, const pthread_attr_t *_Nullable attr,
+	unsigned long flags, const pthread_attr_t DISPATCH_QUEUE_NULLABLE_PTHREAD_ATTR_PTR *_Nullable attr,
 	dispatch_block_t _Nullable configure);
 
 /*!
@@ -278,11 +285,12 @@ dispatch_pthread_root_queue_copy_current(void);
 
 /*!
  * @constant DISPATCH_APPLY_CURRENT_ROOT_QUEUE
- * @discussion Constant to pass to the dispatch_apply() and dispatch_apply_f()
- * functions to indicate that the root queue for the current thread should be
- * used (i.e. one of the global concurrent queues or a queue created with
- * dispatch_pthread_root_queue_create()). If there is no such queue, the
- * default priority global concurrent queue will be used.
+ *
+ * @discussion
+ * This constant is deprecated, please use DISPATCH_APPLY_AUTO.
+ *
+ * DISPATCH_APPLY_AUTO also selects the current pthread root queue if
+ * applicable.
  */
 #define DISPATCH_APPLY_CURRENT_ROOT_QUEUE ((dispatch_queue_t _Nonnull)0)
 
@@ -322,6 +330,20 @@ void
 dispatch_async_enforce_qos_class_f(dispatch_queue_t queue,
 	void *_Nullable context, dispatch_function_t work);
 
+#ifdef __ANDROID__
+/*!
+ * @function _dispatch_install_thread_detach_callback
+ *
+ * @param cb
+ * Function to be called before each worker thread exits to detach JVM.
+ *
+ * Hook to be able to detach threads from the Java JVM before they exit.
+ * If JNI has been used on a thread on Android it needs to have been
+ * "detached" before the thread exits or the application will crash.
+ */
+DISPATCH_EXPORT
+void _dispatch_install_thread_detach_callback(dispatch_function_t cb);
+#endif
 
 __END_DECLS
 

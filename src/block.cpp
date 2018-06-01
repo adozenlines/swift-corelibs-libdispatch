@@ -32,6 +32,8 @@ extern "C" {
 #include "internal.h"
 }
 
+// NOTE: this file must not contain any atomic operations
+
 #if DISPATCH_DEBUG && DISPATCH_BLOCK_PRIVATE_DATA_DEBUG
 #define _dispatch_block_private_data_debug(msg, ...) \
 		_dispatch_debug("block_private[%p]: " msg, (this), ##__VA_ARGS__)
@@ -67,7 +69,9 @@ struct dispatch_block_private_data_s {
 	{
 		// copy constructor, create copy with retained references
 		if (dbpd_voucher) voucher_retain(dbpd_voucher);
-		if (o.dbpd_block) dbpd_block = _dispatch_Block_copy(o.dbpd_block);
+		if (o.dbpd_block) {
+			dbpd_block = reinterpret_cast<dispatch_block_t>(_dispatch_Block_copy(o.dbpd_block));
+		}
 		_dispatch_block_private_data_debug("copy from %p, block: %p from %p",
 				&o, dbpd_block, o.dbpd_block);
 		if (!o.dbpd_magic) return; // No group in initial copy of stack object
@@ -83,7 +87,8 @@ struct dispatch_block_private_data_s {
 			((void (*)(dispatch_group_t))dispatch_release)(dbpd_group);
 		}
 		if (dbpd_queue) {
-			((void (*)(os_mpsc_queue_t))_os_object_release_internal)(dbpd_queue);
+			((void (*)(os_mpsc_queue_t, uint16_t))
+					_os_object_release_internal_n)(dbpd_queue, 2);
 		}
 		if (dbpd_block) Block_release(dbpd_block);
 		if (dbpd_voucher) voucher_release(dbpd_voucher);
@@ -95,22 +100,18 @@ _dispatch_block_create(dispatch_block_flags_t flags, voucher_t voucher,
 		pthread_priority_t pri, dispatch_block_t block)
 {
 	struct dispatch_block_private_data_s dbpds(flags, voucher, pri, block);
-	return _dispatch_Block_copy(^{
+	return reinterpret_cast<dispatch_block_t>(_dispatch_Block_copy(^{
 		// Capture stack object: invokes copy constructor (17094902)
 		(void)dbpds;
 		_dispatch_block_invoke_direct(&dbpds);
-	});
+	}));
 }
 
 extern "C" {
 // The compiler hides the name of the function it generates, and changes it if
 // we try to reference it directly, but the linker still sees it.
 extern void DISPATCH_BLOCK_SPECIAL_INVOKE(void *)
-#ifdef __linux__
-		asm("___dispatch_block_create_block_invoke");
-#else
-		asm("____dispatch_block_create_block_invoke");
-#endif
+		__asm__(OS_STRINGIFY(__USER_LABEL_PREFIX__) "___dispatch_block_create_block_invoke");
 void (*_dispatch_block_special_invoke)(void*) = DISPATCH_BLOCK_SPECIAL_INVOKE;
 }
 

@@ -27,15 +27,20 @@
 #ifndef __DISPATCH_OS_SHIMS__
 #define __DISPATCH_OS_SHIMS__
 
+#if !defined(_WIN32)
 #include <pthread.h>
-#ifdef __linux__
-#include "shims/linux_stubs.h"
+#endif
+#if defined(_WIN32)
+#include "shims/generic_win_stubs.h"
+#elif defined(__unix__)
+#include "shims/generic_unix_stubs.h"
 #endif
 
 #ifdef __ANDROID__
 #include "shims/android_stubs.h"
 #endif
 
+#include "shims/hw_config.h"
 #include "shims/priority.h"
 
 #if HAVE_PTHREAD_WORKQUEUES
@@ -49,6 +54,10 @@
 #endif
 #endif // HAVE_PTHREAD_WORKQUEUES
 
+#if DISPATCH_USE_INTERNAL_WORKQUEUE
+#include "event/workqueue_internal.h"
+#endif
+
 #if HAVE_PTHREAD_NP_H
 #include <pthread_np.h>
 #endif
@@ -61,20 +70,13 @@
 #define FD_COPY(f, t) (void)(*(t) = *(f))
 #endif
 
-#if TARGET_OS_WIN32
-#define bzero(ptr,len) memset((ptr), 0, (len))
-#define snprintf _snprintf
+#if HAVE_STRLCPY
+#include <string.h>
+#else // that is, if !HAVE_STRLCPY
 
-inline size_t strlcpy(char *dst, const char *src, size_t size) {
-	int res = strlen(dst) + strlen(src) + 1;
-	if (size > 0) {
-		size_t n = size - 1;
-		strncpy(dst, src, n);
-		dst[n] = 0;
-	}
-	return res;
-}
-#endif // TARGET_OS_WIN32
+size_t strlcpy(char *dst, const char *src, size_t size);
+
+#endif // HAVE_STRLCPY
 
 #if PTHREAD_WORKQUEUE_SPI_VERSION < 20140716
 static inline int
@@ -143,6 +145,51 @@ _pthread_workqueue_should_narrow(pthread_priority_t priority)
 }
 #endif
 
+#if HAVE_PTHREAD_QOS_H && __has_include(<pthread/qos_private.h>) && \
+		defined(PTHREAD_MAX_PARALLELISM_PHYSICAL) && \
+		DISPATCH_HAVE_HW_CONFIG_COMMPAGE && \
+		DISPATCH_MIN_REQUIRED_OSX_AT_LEAST(109900)
+#define DISPATCH_USE_PTHREAD_QOS_MAX_PARALLELISM 1
+#define DISPATCH_MAX_PARALLELISM_PHYSICAL PTHREAD_MAX_PARALLELISM_PHYSICAL
+#else
+#define DISPATCH_MAX_PARALLELISM_PHYSICAL 0x1
+#endif
+#define DISPATCH_MAX_PARALLELISM_ACTIVE 0x2
+_Static_assert(!(DISPATCH_MAX_PARALLELISM_PHYSICAL &
+		DISPATCH_MAX_PARALLELISM_ACTIVE), "Overlapping parallelism flags");
+
+DISPATCH_ALWAYS_INLINE
+static inline uint32_t
+_dispatch_qos_max_parallelism(dispatch_qos_t qos, unsigned long flags)
+{
+	uint32_t p;
+	int r = 0;
+
+	if (qos) {
+#if DISPATCH_USE_PTHREAD_QOS_MAX_PARALLELISM
+		r = pthread_qos_max_parallelism(_dispatch_qos_to_qos_class(qos),
+				flags & PTHREAD_MAX_PARALLELISM_PHYSICAL);
+#endif
+	}
+	if (likely(r > 0)) {
+		p = (uint32_t)r;
+	} else {
+		p = (flags & DISPATCH_MAX_PARALLELISM_PHYSICAL) ?
+				dispatch_hw_config(physical_cpus) :
+				dispatch_hw_config(logical_cpus);
+	}
+	if (flags & DISPATCH_MAX_PARALLELISM_ACTIVE) {
+		uint32_t active_cpus = dispatch_hw_config(active_cpus);
+		if ((flags & DISPATCH_MAX_PARALLELISM_PHYSICAL) &&
+				active_cpus < dispatch_hw_config(logical_cpus)) {
+			active_cpus /= dispatch_hw_config(logical_cpus) /
+					dispatch_hw_config(physical_cpus);
+		}
+		if (active_cpus < p) p = active_cpus;
+	}
+	return p;
+}
+
 #if !HAVE_NORETURN_BUILTIN_TRAP
 /*
  * XXXRW: Work-around for possible clang bug in which __builtin_trap() is not
@@ -170,7 +217,6 @@ void __builtin_trap(void);
 #include "shims/yield.h"
 #include "shims/lock.h"
 
-#include "shims/hw_config.h"
 #include "shims/perfmon.h"
 
 #include "shims/getprogname.h"
@@ -199,7 +245,7 @@ void __builtin_trap(void);
 
 #if __has_feature(c_static_assert)
 #define __dispatch_is_array(x) \
-	_Static_assert(!__builtin_types_compatible_p(typeof((x)[0]) *, typeof(x)), \
+	_Static_assert(!__builtin_types_compatible_p(__typeof__((x)[0]) *, __typeof__(x)), \
 				#x " isn't an array")
 #define countof(x) \
 	({ __dispatch_is_array(x); sizeof(x) / sizeof((x)[0]); })
@@ -224,7 +270,8 @@ _dispatch_mempcpy(void *ptr, const void *data, size_t len)
 #define _dispatch_clear_stack(s) do { \
 		void *a[(s)/sizeof(void*) ? (s)/sizeof(void*) : 1]; \
 		a[0] = pthread_get_stackaddr_np(pthread_self()); \
-		bzero((void*)&a[1], (size_t)(a[0] - (void*)&a[1])); \
+		void* volatile const p = (void*)&a[1]; /* <rdar://32604885> */ \
+		bzero((void*)p, (size_t)(a[0] - (void*)&a[1])); \
 	} while (0)
 #else
 #define _dispatch_clear_stack(s)

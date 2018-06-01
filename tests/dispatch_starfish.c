@@ -37,7 +37,9 @@
 #define COUNT	1000ul
 #define LAPS	10ul
 
-#if TARGET_OS_EMBEDDED
+#if LENIENT_DEADLINES
+#define ACCEPTABLE_LATENCY 10000
+#elif TARGET_OS_EMBEDDED
 #define ACCEPTABLE_LATENCY 3000
 #else
 #define ACCEPTABLE_LATENCY 1000
@@ -70,7 +72,7 @@ collect(void *context __attribute__((unused)))
 
 	printf("lap: %zd\n", lap_count_down);
 	printf("count: %lu\n", COUNT);
-	printf("delta: %lu ns\n", delta);
+	printf("delta: %lu ns\n", (unsigned long)delta);
 	printf("math: %Lf ns / lap\n", math);
 
 	for (i = 0; i < COUNT; i++) {
@@ -79,7 +81,7 @@ collect(void *context __attribute__((unused)))
 
 	// our malloc could be a lot better,
 	// this result is really a malloc torture test
-	test_long_less_than("Latency" , (unsigned long)math, ACCEPTABLE_LATENCY);
+	test_long_less_than("Latency" , (long)math, ACCEPTABLE_LATENCY);
 
 	if (--lap_count_down) {
 		return do_test();

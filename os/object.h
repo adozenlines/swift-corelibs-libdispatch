@@ -23,13 +23,13 @@
 
 #ifdef __APPLE__
 #include <Availability.h>
-#include <TargetConditionals.h>
 #include <os/availability.h>
-#endif
-#ifndef __linux__
+#include <TargetConditionals.h>
 #include <os/base.h>
-#else
-#include <os/linux_base.h>
+#elif defined(_WIN32)
+#include <os/generic_win_base.h>
+#elif defined(__unix__)
+#include <os/generic_unix_base.h>
 #endif
 
 /*!

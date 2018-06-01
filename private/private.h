@@ -28,7 +28,14 @@
 #define __DISPATCH_PRIVATE__
 
 #ifdef __APPLE__
+#include <Availability.h>
+#include <os/availability.h>
 #include <TargetConditionals.h>
+#include <os/base.h>
+#elif defined(_WIN32)
+#include <os/generic_win_base.h>
+#elif defined(__unix__)
+#include <os/generic_unix_base.h>
 #endif
 
 #if TARGET_OS_MAC
@@ -36,13 +43,15 @@
 #include <mach/mach.h>
 #include <mach/message.h>
 #endif
-#if HAVE_UNISTD_H
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
 #endif
-#if HAVE_SYS_CDEFS_H
-#include <sys/cdefs.h>
-#endif
+#if !defined(_WIN32)
 #include <pthread.h>
+#endif
+#if TARGET_OS_MAC
+#include <pthread/qos.h>
+#endif
 
 #ifndef __DISPATCH_BUILDING_DISPATCH__
 #include <dispatch/dispatch.h>
@@ -66,7 +75,7 @@
 #endif /* !__DISPATCH_BUILDING_DISPATCH__ */
 
 // <rdar://problem/9627726> Check that public and private dispatch headers match
-#if DISPATCH_API_VERSION != 20160831 // Keep in sync with <dispatch/dispatch.h>
+#if DISPATCH_API_VERSION != 20170124 // Keep in sync with <dispatch/dispatch.h>
 #error "Dispatch header mismatch between /usr/include and /usr/local/include"
 #endif
 
@@ -167,7 +176,7 @@ void _dispatch_prohibit_transition_to_multithreaded(bool prohibit);
 
 #if TARGET_OS_MAC
 #define DISPATCH_COCOA_COMPAT 1
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
 #define DISPATCH_COCOA_COMPAT 1
 #else
 #define DISPATCH_COCOA_COMPAT 0
@@ -179,7 +188,7 @@ void _dispatch_prohibit_transition_to_multithreaded(bool prohibit);
 
 #if TARGET_OS_MAC
 typedef mach_port_t dispatch_runloop_handle_t;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
 typedef int dispatch_runloop_handle_t;
 #else
 #error "runloop support not implemented on this platform"
@@ -214,6 +223,16 @@ API_AVAILABLE(macos(10.9), ios(7.0))
 DISPATCH_EXPORT DISPATCH_WARN_RESULT DISPATCH_NOTHROW
 mach_port_t
 _dispatch_runloop_root_queue_get_port_4CF(dispatch_queue_t queue);
+
+#ifdef __BLOCKS__
+API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0))
+DISPATCH_EXPORT DISPATCH_MALLOC DISPATCH_RETURNS_RETAINED DISPATCH_WARN_RESULT
+DISPATCH_NOTHROW
+dispatch_queue_t
+_dispatch_network_root_queue_create_4NW(const char *_Nullable label,
+		const pthread_attr_t *_Nullable attrs,
+		dispatch_block_t _Nullable configure);
+#endif
 #endif
 
 API_AVAILABLE(macos(10.9), ios(7.0))
@@ -241,6 +260,11 @@ DISPATCH_EXPORT
 void (*_Nullable _dispatch_end_NSAutoReleasePool)(void *);
 
 #endif /* DISPATCH_COCOA_COMPAT */
+
+API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0))
+DISPATCH_EXPORT DISPATCH_NOTHROW
+void
+_dispatch_poll_for_events_4launchd(void);
 
 __END_DECLS
 

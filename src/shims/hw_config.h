@@ -27,7 +27,21 @@
 #ifndef __DISPATCH_SHIMS_HW_CONFIG__
 #define __DISPATCH_SHIMS_HW_CONFIG__
 
-#if !TARGET_OS_WIN32
+#ifdef __SIZEOF_POINTER__
+#define DISPATCH_SIZEOF_PTR __SIZEOF_POINTER__
+#elif defined(_WIN64)
+#define DISPATCH_SIZEOF_PTR 8
+#elif defined(_WIN32)
+#define DISPATCH_SIZEOF_PTR 4
+#elif defined(_MSC_VER)
+#error "could not determine pointer size as a constant int for MSVC"
+#elif defined(__LP64__) || defined(__LLP64__)
+#define DISPATCH_SIZEOF_PTR 8
+#elif defined(__ILP32__)
+#define DISPATCH_SIZEOF_PTR 4
+#else
+#error "could not determine pointer size as a constant int"
+#endif // __SIZEOF_POINTER__
 
 typedef enum {
 	_dispatch_hw_config_logical_cpus,
@@ -85,7 +99,7 @@ _dispatch_hw_get_config(_dispatch_hw_config_t c)
 	switch (c) {
 	case _dispatch_hw_config_logical_cpus:
 	case _dispatch_hw_config_physical_cpus:
-		return sysconf(_SC_NPROCESSORS_CONF);
+		return (uint32_t)sysconf(_SC_NPROCESSORS_CONF);
 	case _dispatch_hw_config_active_cpus:
 		{
 #ifdef __USE_GNU
@@ -94,10 +108,68 @@ _dispatch_hw_get_config(_dispatch_hw_config_t c)
 			// is restricted to a subset of the online cpus (eg via numactl).
 			cpu_set_t cpuset;
 			if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0)
-				return CPU_COUNT(&cpuset);
+				return (uint32_t)CPU_COUNT(&cpuset);
 #endif
-			return sysconf(_SC_NPROCESSORS_ONLN);
+			return (uint32_t)sysconf(_SC_NPROCESSORS_ONLN);
 		}
+	}
+#elif defined(_WIN32)
+	PSYSTEM_LOGICAL_PROCESSOR_INFORMATION slpiInfo = NULL;
+	PSYSTEM_LOGICAL_PROCESSOR_INFORMATION slpiCurrent = NULL;
+	DWORD dwProcessorLogicalCount = 0;
+	DWORD dwProcessorPackageCount = 0;
+	DWORD dwProcessorCoreCount = 0;
+	DWORD dwSize = 0;
+
+	while (true) {
+		DWORD dwResult;
+
+		if (GetLogicalProcessorInformation(slpiInfo, &dwSize))
+			break;
+
+		dwResult = GetLastError();
+
+		if (slpiInfo)
+			free(slpiInfo);
+
+		if (dwResult == ERROR_INSUFFICIENT_BUFFER) {
+			slpiInfo = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION)malloc(dwSize);
+			dispatch_assert(slpiInfo);
+		} else {
+			slpiInfo = NULL;
+			dwSize = 0;
+			break;
+		}
+	}
+
+	for (slpiCurrent = slpiInfo;
+	     dwSize >= sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+	     slpiCurrent++, dwSize -= sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION)) {
+		switch (slpiCurrent->Relationship) {
+		case RelationProcessorCore:
+			++dwProcessorCoreCount;
+			dwProcessorLogicalCount += __popcnt64(slpiCurrent->ProcessorMask);
+			break;
+		case RelationProcessorPackage:
+			++dwProcessorPackageCount;
+			break;
+		case RelationNumaNode:
+		case RelationCache:
+		case RelationGroup:
+		case RelationAll:
+			break;
+		}
+	}
+
+	free(slpiInfo);
+
+	switch (c) {
+	case _dispatch_hw_config_logical_cpus:
+		return dwProcessorLogicalCount;
+	case _dispatch_hw_config_physical_cpus:
+		return dwProcessorPackageCount;
+	case _dispatch_hw_config_active_cpus:
+		return dwProcessorCoreCount;
 	}
 #else
 	const char *name = NULL;
@@ -143,32 +215,5 @@ _dispatch_hw_config_init(void)
 #undef dispatch_hw_config_init
 
 #endif // DISPATCH_HAVE_HW_CONFIG_COMMPAGE
-
-#else // TARGET_OS_WIN32
-
-static inline long
-_dispatch_count_bits(unsigned long value)
-{
-	long bits = 0;
-	while (value) {
-		bits += (value & 1);
-		value = value >> 1;
-	}
-	return bits;
-}
-
-static inline uint32_t
-_dispatch_get_ncpus(void)
-{
-	uint32_t val;
-	DWORD_PTR procmask, sysmask;
-	if (GetProcessAffinityMask(GetCurrentProcess(), &procmask, &sysmask)) {
-		val = _dispatch_count_bits(procmask);
-	} else {
-		val = 1;
-	}
-	return val;
-}
-#endif // TARGET_OS_WIN32
 
 #endif /* __DISPATCH_SHIMS_HW_CONFIG__ */

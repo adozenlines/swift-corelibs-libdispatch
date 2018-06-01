@@ -20,7 +20,9 @@
 
 #include <stdio.h>
 #include <dispatch/dispatch.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <stdlib.h>
 
 #include <bsdtests.h>
@@ -37,7 +39,7 @@ union {
 	char padding[64];
 } indices[BLOCKS];
 
-size_t iterations = QUEUES * BLOCKS * 0.25;
+size_t iterations = (QUEUES * BLOCKS) / 4;
 
 static void
 noop(void *ctxt __attribute__((unused)))
@@ -57,7 +59,7 @@ cleanup(void *ctxt __attribute__((unused)))
 	exit(0);
 }
 
-void
+static void
 histogram(void)
 {
 	size_t counts[QUEUES] = {};
@@ -92,7 +94,7 @@ histogram(void)
 	}
 }
 
-void
+static void
 cascade(void* context)
 {
 	size_t idx, *idxptr = context;

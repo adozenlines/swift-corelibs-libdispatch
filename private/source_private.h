@@ -102,6 +102,13 @@ DISPATCH_SOURCE_TYPE_DECL(memorystatus);
 API_AVAILABLE(macos(10.8), ios(6.0)) DISPATCH_LINUX_UNAVAILABLE()
 DISPATCH_SOURCE_TYPE_DECL(sock);
 
+/*!
+ * @const DISPATCH_SOURCE_TYPE_NW_CHANNEL
+ * @discussion A dispatch source that monitors events on a network channel.
+ */
+#define DISPATCH_SOURCE_TYPE_NW_CHANNEL (&_dispatch_source_type_nw_channel)
+API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0)) DISPATCH_LINUX_UNAVAILABLE()
+DISPATCH_SOURCE_TYPE_DECL(nw_channel);
 
 __END_DECLS
 
@@ -341,11 +348,16 @@ enum {
  *
  * @constant DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL
  * The memory of the process has reached 100% of its high watermark limit.
+ *
+ * @constant DISPATCH_MEMORYPRESSURE_MSL_STATUS
+ * Mask for enabling/disabling malloc stack logging.
  */
 enum {
-	DISPATCH_MEMORYPRESSURE_PROC_LIMIT_WARN DISPATCH_ENUM_API_AVAILABLE(macos(10.12), ios(10.10), tvos(10.10), watchos(3.0)) = 0x10,
+	DISPATCH_MEMORYPRESSURE_PROC_LIMIT_WARN DISPATCH_ENUM_API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0)) = 0x10,
 
-	DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL DISPATCH_ENUM_API_AVAILABLE(macos(10.12), ios(10.10), tvos(10.10), watchos(3.0)) = 0x20,
+	DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL DISPATCH_ENUM_API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0)) = 0x20,
+	
+	DISPATCH_MEMORYPRESSURE_MSL_STATUS DISPATCH_ENUM_API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0)) = 0xf0000000,
 };
 
 /*!

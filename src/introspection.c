@@ -137,7 +137,7 @@ _dispatch_introspection_thread_add(void)
 	_dispatch_unfair_lock_unlock(&_dispatch_introspection.threads_lock);
 }
 
-static void
+static DISPATCH_TSD_DTOR_CC void
 _dispatch_introspection_thread_remove(void *ctxt)
 {
 	dispatch_introspection_thread_t dit = ctxt;
@@ -219,7 +219,7 @@ _dispatch_introspection_continuation_get_info(dispatch_queue_t dq,
 	} else {
 		if (flags & DISPATCH_OBJ_SYNC_WAITER_BIT) {
 			dispatch_sync_context_t dsc = (dispatch_sync_context_t)dc;
-			waiter = pthread_from_mach_thread_np((mach_port_t)dc->dc_data);
+			waiter = pthread_from_mach_thread_np(dsc->dsc_waiter);
 			ctxt = dsc->dsc_ctxt;
 			func = dsc->dsc_func;
 		}
@@ -439,7 +439,7 @@ dispatch_introspection_hooks_s _dispatch_introspection_hook_callouts_enabled = {
 		(slowpath(_dispatch_introspection_hooks.h))
 
 #define DISPATCH_INTROSPECTION_HOOK_CALLOUT(h, ...) ({ \
-		typeof(_dispatch_introspection_hooks.h) _h; \
+		__typeof__(_dispatch_introspection_hooks.h) _h; \
 		_h = _dispatch_introspection_hooks.h; \
 		if (slowpath((void*)(_h) != DISPATCH_INTROSPECTION_NO_HOOK)) { \
 			_h(__VA_ARGS__); \
@@ -447,7 +447,7 @@ dispatch_introspection_hooks_s _dispatch_introspection_hook_callouts_enabled = {
 
 #define DISPATCH_INTROSPECTION_INTERPOSABLE_HOOK(h) \
 		DISPATCH_EXPORT void _dispatch_introspection_hook_##h(void) \
-		asm("_dispatch_introspection_hook_" #h); \
+		__asm__("_dispatch_introspection_hook_" #h); \
 		void _dispatch_introspection_hook_##h(void) {}
 
 #define DISPATCH_INTROSPECTION_INTERPOSABLE_HOOK_CALLOUT(h, ...)\

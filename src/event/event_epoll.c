@@ -47,11 +47,13 @@ typedef struct dispatch_muxnote_s {
 	TAILQ_ENTRY(dispatch_muxnote_s) dmn_list;
 	TAILQ_HEAD(, dispatch_unote_linkage_s) dmn_readers_head;
 	TAILQ_HEAD(, dispatch_unote_linkage_s) dmn_writers_head;
-	int     dmn_fd;
-	int     dmn_ident;
-	uint32_t dmn_events;
-	int16_t dmn_filter;
-	bool    dmn_socket_listener;
+	int       dmn_fd;
+	uint32_t  dmn_ident;
+	uint32_t  dmn_events;
+	uint16_t  dmn_disarmed_events;
+	int8_t    dmn_filter;
+	bool      dmn_skip_outq_ioctl : 1;
+	bool      dmn_skip_inq_ioctl : 1;
 } *dispatch_muxnote_t;
 
 typedef struct dispatch_epoll_timeout_s {
@@ -83,10 +85,17 @@ static struct dispatch_epoll_timeout_s _dispatch_epoll_timeout[] = {
 #pragma mark dispatch_muxnote_t
 
 DISPATCH_ALWAYS_INLINE
-static inline struct dispatch_muxnote_bucket_s *
-_dispatch_muxnote_bucket(int ident)
+static inline uint32_t
+_dispatch_muxnote_armed_events(dispatch_muxnote_t dmn)
 {
-	return &_dispatch_sources[DSL_HASH((uint32_t)ident)];
+	return dmn->dmn_events & ~dmn->dmn_disarmed_events;
+}
+
+DISPATCH_ALWAYS_INLINE
+static inline struct dispatch_muxnote_bucket_s *
+_dispatch_muxnote_bucket(uint32_t ident)
+{
+	return &_dispatch_sources[DSL_HASH(ident)];
 }
 #define _dispatch_unote_muxnote_bucket(du) \
 	_dispatch_muxnote_bucket(du._du->du_ident)
@@ -94,7 +103,7 @@ _dispatch_muxnote_bucket(int ident)
 DISPATCH_ALWAYS_INLINE
 static inline dispatch_muxnote_t
 _dispatch_muxnote_find(struct dispatch_muxnote_bucket_s *dmb,
-		uint64_t ident, int16_t filter)
+		uint32_t ident, int8_t filter)
 {
 	dispatch_muxnote_t dmn;
 	if (filter == EVFILT_WRITE) filter = EVFILT_READ;
@@ -111,33 +120,57 @@ _dispatch_muxnote_find(struct dispatch_muxnote_bucket_s *dmb,
 static void
 _dispatch_muxnote_dispose(dispatch_muxnote_t dmn)
 {
-	if (dmn->dmn_filter != EVFILT_READ || dmn->dmn_fd != dmn->dmn_ident) {
+	if (dmn->dmn_filter != EVFILT_READ || (uint32_t)dmn->dmn_fd != dmn->dmn_ident) {
 		close(dmn->dmn_fd);
 	}
 	free(dmn);
 }
 
+static pthread_t manager_thread;
+
+static void
+_dispatch_muxnote_signal_block_and_raise(int signo)
+{
+	// On linux, for signals to be delivered to the signalfd, signals
+	// must be blocked, else any thread that hasn't them blocked may
+	// receive them.  Fix that by lazily noticing, blocking said signal,
+	// and raising the signal again when it happens
+	_dispatch_sigmask();
+	pthread_kill(manager_thread, signo);
+}
+
 static dispatch_muxnote_t
 _dispatch_muxnote_create(dispatch_unote_t du, uint32_t events)
 {
+	static sigset_t signals_with_unotes;
+	static struct sigaction sa = {
+		.sa_handler = _dispatch_muxnote_signal_block_and_raise,
+		.sa_flags = SA_RESTART,
+	};
+
 	dispatch_muxnote_t dmn;
 	struct stat sb;
-	int fd = du._du->du_ident;
-	int16_t filter = du._du->du_filter;
-	bool socket_listener = false;
+	int fd = (int)du._du->du_ident;
+	int8_t filter = du._du->du_filter;
+	bool skip_outq_ioctl = false, skip_inq_ioctl = false;
 	sigset_t sigmask;
 
 	switch (filter) {
-	case EVFILT_SIGNAL:
+	case EVFILT_SIGNAL: {
+		int signo = (int)du._du->du_ident;
+		if (!sigismember(&signals_with_unotes, signo)) {
+			manager_thread = pthread_self();
+			sigaddset(&signals_with_unotes, signo);
+			sigaction(signo, &sa, NULL);
+		}
 		sigemptyset(&sigmask);
-		sigaddset(&sigmask, du._du->du_ident);
+		sigaddset(&sigmask, signo);
 		fd = signalfd(-1, &sigmask, SFD_NONBLOCK | SFD_CLOEXEC);
 		if (fd < 0) {
 			return NULL;
 		}
-		sigprocmask(SIG_BLOCK, &sigmask, NULL);
 		break;
-
+	}
 	case EVFILT_WRITE:
 		filter = EVFILT_READ;
 	case EVFILT_READ:
@@ -150,11 +183,15 @@ _dispatch_muxnote_create(dispatch_unote_t du, uint32_t events)
 			if (fd < 0) {
 				return NULL;
 			}
+			// Linux doesn't support output queue size ioctls for regular files
+			skip_outq_ioctl = true;
 		} else if (S_ISSOCK(sb.st_mode)) {
 			socklen_t vlen = sizeof(int);
 			int v;
+			// Linux doesn't support saying how many clients are ready to be
+			// accept()ed for sockets
 			if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &v, &vlen) == 0) {
-				socket_listener = (bool)v;
+				skip_inq_ioctl = (bool)v;
 			}
 		}
 		break;
@@ -170,40 +207,35 @@ _dispatch_muxnote_create(dispatch_unote_t du, uint32_t events)
 	dmn->dmn_ident = du._du->du_ident;
 	dmn->dmn_filter = filter;
 	dmn->dmn_events = events;
-	dmn->dmn_socket_listener = socket_listener;
+	dmn->dmn_skip_outq_ioctl = skip_outq_ioctl;
+	dmn->dmn_skip_inq_ioctl = skip_inq_ioctl;
 	return dmn;
 }
 
 #pragma mark dispatch_unote_t
 
 static int
-_dispatch_epoll_update(dispatch_muxnote_t dmn, int op)
+_dispatch_epoll_update(dispatch_muxnote_t dmn, uint32_t events, int op)
 {
 	dispatch_once_f(&epoll_init_pred, NULL, _dispatch_epoll_init);
 	struct epoll_event ev = {
-		.events = dmn->dmn_events,
+		.events = events,
 		.data = { .ptr = dmn },
 	};
 	return epoll_ctl(_dispatch_epfd, op, dmn->dmn_fd, &ev);
 }
 
-bool
-_dispatch_unote_register(dispatch_unote_t du, dispatch_wlh_t wlh,
-		dispatch_priority_t pri)
+DISPATCH_ALWAYS_INLINE
+static inline uint32_t
+_dispatch_unote_required_events(dispatch_unote_t du)
 {
-	struct dispatch_muxnote_bucket_s *dmb;
-	dispatch_muxnote_t dmn;
 	uint32_t events = EPOLLFREE;
-
-	dispatch_assert(!_dispatch_unote_registered(du));
-	du._du->du_priority = pri;
 
 	switch (du._du->du_filter) {
 	case DISPATCH_EVFILT_CUSTOM_ADD:
 	case DISPATCH_EVFILT_CUSTOM_OR:
 	case DISPATCH_EVFILT_CUSTOM_REPLACE:
-		du._du->du_wlh = wlh;
-		return true;
+		return 0;
 	case EVFILT_WRITE:
 		events |= EPOLLOUT;
 		break;
@@ -216,24 +248,41 @@ _dispatch_unote_register(dispatch_unote_t du, dispatch_wlh_t wlh,
 		events |= EPOLLONESHOT;
 	}
 
+	return events;
+}
+
+bool
+_dispatch_unote_register(dispatch_unote_t du,
+		DISPATCH_UNUSED dispatch_wlh_t wlh, dispatch_priority_t pri)
+{
+	struct dispatch_muxnote_bucket_s *dmb;
+	dispatch_muxnote_t dmn;
+	uint32_t events = _dispatch_unote_required_events(du);
+
+	dispatch_assert(!_dispatch_unote_registered(du));
+	du._du->du_priority = pri;
+
 	dmb = _dispatch_unote_muxnote_bucket(du);
 	dmn = _dispatch_unote_muxnote_find(dmb, du);
 	if (dmn) {
-		events &= ~dmn->dmn_events;
-		if (events) {
-			dmn->dmn_events |= events;
-			if (_dispatch_epoll_update(dmn, EPOLL_CTL_MOD) < 0) {
-				dmn->dmn_events &= ~events;
+		if (events & ~_dispatch_muxnote_armed_events(dmn)) {
+			events |= _dispatch_muxnote_armed_events(dmn);
+			if (_dispatch_epoll_update(dmn, events, EPOLL_CTL_MOD) < 0) {
 				dmn = NULL;
+			} else {
+				dmn->dmn_events |= events;
+				dmn->dmn_disarmed_events &= ~events;
 			}
 		}
 	} else {
 		dmn = _dispatch_muxnote_create(du, events);
-		if (_dispatch_epoll_update(dmn, EPOLL_CTL_ADD) < 0) {
-			_dispatch_muxnote_dispose(dmn);
-			dmn = NULL;
-		} else {
-			TAILQ_INSERT_TAIL(dmb, dmn, dmn_list);
+		if (dmn) {
+			if (_dispatch_epoll_update(dmn, events, EPOLL_CTL_ADD) < 0) {
+				_dispatch_muxnote_dispose(dmn);
+				dmn = NULL;
+			} else {
+				TAILQ_INSERT_TAIL(dmb, dmn, dmn_list);
+			}
 		}
 	}
 
@@ -245,7 +294,8 @@ _dispatch_unote_register(dispatch_unote_t du, dispatch_wlh_t wlh,
 			TAILQ_INSERT_TAIL(&dmn->dmn_readers_head, dul, du_link);
 		}
 		dul->du_muxnote = dmn;
-		du._du->du_wlh = DISPATCH_WLH_GLOBAL;
+		dispatch_assert(du._du->du_wlh == NULL);
+		du._du->du_wlh = DISPATCH_WLH_ANON;
 	}
 	return dmn != NULL;
 }
@@ -255,12 +305,17 @@ _dispatch_unote_resume(dispatch_unote_t du)
 {
 	dispatch_muxnote_t dmn = _dispatch_unote_get_linkage(du)->du_muxnote;
 	dispatch_assert(_dispatch_unote_registered(du));
+	uint32_t events = _dispatch_unote_required_events(du);
 
-	_dispatch_epoll_update(dmn, EPOLL_CTL_MOD);
+	if (events & dmn->dmn_disarmed_events) {
+		dmn->dmn_disarmed_events &= ~events;
+		events = _dispatch_muxnote_armed_events(dmn);
+		_dispatch_epoll_update(dmn, events, EPOLL_CTL_MOD);
+	}
 }
 
 bool
-_dispatch_unote_unregister(dispatch_unote_t du, uint32_t flags)
+_dispatch_unote_unregister(dispatch_unote_t du, DISPATCH_UNUSED uint32_t flags)
 {
 	switch (du._du->du_filter) {
 	case DISPATCH_EVFILT_CUSTOM_ADD:
@@ -283,21 +338,32 @@ _dispatch_unote_unregister(dispatch_unote_t du, uint32_t flags)
 		dul->du_muxnote = NULL;
 
 		if (TAILQ_EMPTY(&dmn->dmn_readers_head)) {
-			events &= ~EPOLLIN;
+			events &= (uint32_t)~EPOLLIN;
+			if (dmn->dmn_disarmed_events & EPOLLIN) {
+				dmn->dmn_disarmed_events &= (uint16_t)~EPOLLIN;
+				dmn->dmn_events &= (uint32_t)~EPOLLIN;
+			}
 		}
 		if (TAILQ_EMPTY(&dmn->dmn_writers_head)) {
-			events &= ~EPOLLOUT;
+			events &= (uint32_t)~EPOLLOUT;
+			if (dmn->dmn_disarmed_events & EPOLLOUT) {
+				dmn->dmn_disarmed_events &= (uint16_t)~EPOLLOUT;
+				dmn->dmn_events &= (uint32_t)~EPOLLOUT;
+			}
 		}
 
-		if (events == dmn->dmn_events) {
-			// nothing to do
-		} else if (events & (EPOLLIN | EPOLLOUT)) {
-			_dispatch_epoll_update(dmn, EPOLL_CTL_MOD);
+		if (events & (EPOLLIN | EPOLLOUT)) {
+			if (events != _dispatch_muxnote_armed_events(dmn)) {
+				dmn->dmn_events = events;
+				events = _dispatch_muxnote_armed_events(dmn);
+				_dispatch_epoll_update(dmn, events, EPOLL_CTL_MOD);
+			}
 		} else {
 			epoll_ctl(_dispatch_epfd, EPOLL_CTL_DEL, dmn->dmn_fd, NULL);
 			TAILQ_REMOVE(_dispatch_unote_muxnote_bucket(du), dmn, dmn_list);
 			_dispatch_muxnote_dispose(dmn);
 		}
+		dispatch_assert(du._du->du_wlh == DISPATCH_WLH_ANON);
 		du._du->du_wlh = NULL;
 	}
 	return true;
@@ -318,32 +384,34 @@ _dispatch_event_merge_timer(dispatch_clock_t clock)
 }
 
 static void
-_dispatch_timeout_program(uint32_t tidx, uint64_t target, uint64_t leeway)
+_dispatch_timeout_program(uint32_t tidx, uint64_t target,
+		DISPATCH_UNUSED uint64_t leeway)
 {
 	dispatch_clock_t clock = DISPATCH_TIMER_CLOCK(tidx);
 	dispatch_epoll_timeout_t timer = &_dispatch_epoll_timeout[clock];
 	struct epoll_event ev = {
 		.events = EPOLLONESHOT | EPOLLIN,
-		.data = { .u32 = timer->det_ident },
+
 	};
-	unsigned long op;
+	int op;
 
 	if (target >= INT64_MAX && !timer->det_registered) {
 		return;
 	}
+	ev.data.u32 = timer->det_ident;
 
 	if (unlikely(timer->det_fd < 0)) {
-		clockid_t clock;
+		clockid_t clockid;
 		int fd;
 		switch (DISPATCH_TIMER_CLOCK(tidx)) {
 		case DISPATCH_CLOCK_MACH:
-			clock = CLOCK_MONOTONIC;
+			clockid = CLOCK_MONOTONIC;
 			break;
 		case DISPATCH_CLOCK_WALL:
-			clock = CLOCK_REALTIME;
+			clockid = CLOCK_REALTIME;
 			break;
 		}
-		fd = timerfd_create(clock, TFD_NONBLOCK | TFD_CLOEXEC);
+		fd = timerfd_create(clockid, TFD_NONBLOCK | TFD_CLOEXEC);
 		if (!dispatch_assume(fd >= 0)) {
 			return;
 		}
@@ -352,7 +420,7 @@ _dispatch_timeout_program(uint32_t tidx, uint64_t target, uint64_t leeway)
 
 	if (target < INT64_MAX) {
 		struct itimerspec its = { .it_value = {
-			.tv_sec  = target / NSEC_PER_SEC,
+			.tv_sec  = (time_t)(target / NSEC_PER_SEC),
 			.tv_nsec = target % NSEC_PER_SEC,
 		} };
 		dispatch_assume_zero(timerfd_settime(timer->det_fd, TFD_TIMER_ABSTIME,
@@ -395,11 +463,6 @@ _dispatch_event_loop_atfork_child(void)
 {
 }
 
-void
-_dispatch_event_loop_init(void)
-{
-}
-
 static void
 _dispatch_epoll_init(void *context DISPATCH_UNUSED)
 {
@@ -424,7 +487,7 @@ _dispatch_epoll_init(void *context DISPATCH_UNUSED)
 		.events = EPOLLIN | EPOLLFREE,
 		.data = { .u32 = DISPATCH_EPOLL_EVENTFD, },
 	};
-	unsigned long op = EPOLL_CTL_ADD;
+	int op = EPOLL_CTL_ADD;
 	if (epoll_ctl(_dispatch_epfd, op, _dispatch_eventfd, &ev) < 0) {
 		DISPATCH_INTERNAL_CRASH(errno, "epoll_ctl() failed");
 	}
@@ -436,7 +499,7 @@ _dispatch_epoll_init(void *context DISPATCH_UNUSED)
 
 void
 _dispatch_event_loop_poke(dispatch_wlh_t wlh DISPATCH_UNUSED,
-		dispatch_priority_t pri DISPATCH_UNUSED, uint32_t flags DISPATCH_UNUSED)
+		uint64_t dq_state DISPATCH_UNUSED, uint32_t flags DISPATCH_UNUSED)
 {
 	dispatch_once_f(&epoll_init_pred, NULL, _dispatch_epoll_init);
 	dispatch_assume_zero(eventfd_write(_dispatch_eventfd, 1));
@@ -447,28 +510,52 @@ _dispatch_event_merge_signal(dispatch_muxnote_t dmn)
 {
 	dispatch_unote_linkage_t dul, dul_next;
 	struct signalfd_siginfo si;
+	ssize_t rc;
 
-	dispatch_assume(read(dmn->dmn_fd, &si, sizeof(si)) == sizeof(si));
-
-	TAILQ_FOREACH_SAFE(dul, &dmn->dmn_readers_head, du_link, dul_next) {
-		dispatch_unote_t du = _dispatch_unote_linkage_get_unote(dul);
-		dux_merge_evt(du._du, EV_ADD|EV_ENABLE|EV_CLEAR, 1, 0, 0);
+	// Linux has the weirdest semantics around signals: if it finds a thread
+	// that has not masked a process wide-signal, it may deliver it to this
+	// thread, meaning that the signalfd may have been made readable, but the
+	// signal consumed through the legacy delivery mechanism.
+	//
+	// Because of this we can get a misfire of the signalfd yielding EAGAIN the
+	// first time around. The _dispatch_muxnote_signal_block_and_raise() hack
+	// will kick in, the thread with the wrong mask will be fixed up, and the
+	// signal delivered to us again properly.
+	if ((rc = read(dmn->dmn_fd, &si, sizeof(si))) == sizeof(si)) {
+		TAILQ_FOREACH_SAFE(dul, &dmn->dmn_readers_head, du_link, dul_next) {
+			dispatch_unote_t du = _dispatch_unote_linkage_get_unote(dul);
+			dux_merge_evt(du._du, EV_ADD|EV_ENABLE|EV_CLEAR, 1, 0, 0);
+		}
+	} else {
+		dispatch_assume(rc == -1 && errno == EAGAIN);
 	}
 }
 
 static uintptr_t
 _dispatch_get_buffer_size(dispatch_muxnote_t dmn, bool writer)
 {
-	unsigned long op = writer ? SIOCOUTQ : SIOCINQ;
 	int n;
 
-	if (!writer && dmn->dmn_socket_listener) {
-		// Linux doesn't support saying how many clients are ready to be
-		// accept()ed
+	if (writer ? dmn->dmn_skip_outq_ioctl : dmn->dmn_skip_inq_ioctl) {
 		return 1;
 	}
 
-	if (dispatch_assume_zero(ioctl(dmn->dmn_ident, op, &n))) {
+	if (ioctl((int)dmn->dmn_ident, writer ? SIOCOUTQ : SIOCINQ, &n) != 0) {
+		switch (errno) {
+		case EINVAL:
+		case ENOTTY:
+			// this file descriptor actually doesn't support the buffer
+			// size ioctl, remember that for next time to avoid the syscall.
+			break;
+		default:
+			dispatch_assume_zero(errno);
+			break;
+		}
+		if (writer) {
+			dmn->dmn_skip_outq_ioctl = true;
+		} else {
+			dmn->dmn_skip_inq_ioctl = true;
+		}
 		return 1;
 	}
 	return (uintptr_t)n;
@@ -479,6 +566,8 @@ _dispatch_event_merge_fd(dispatch_muxnote_t dmn, uint32_t events)
 {
 	dispatch_unote_linkage_t dul, dul_next;
 	uintptr_t data;
+
+	dmn->dmn_disarmed_events |= (events & (EPOLLIN | EPOLLOUT));
 
 	if (events & EPOLLIN) {
 		data = _dispatch_get_buffer_size(dmn, false);
@@ -495,6 +584,9 @@ _dispatch_event_merge_fd(dispatch_muxnote_t dmn, uint32_t events)
 			dux_merge_evt(du._du, EV_ADD|EV_ENABLE|EV_DISPATCH, ~data, 0, 0);
 		}
 	}
+
+	events = _dispatch_muxnote_armed_events(dmn);
+	if (events) _dispatch_epoll_update(dmn, events, EPOLL_CTL_MOD);
 }
 
 DISPATCH_NOINLINE
@@ -556,6 +648,42 @@ retry:
 			}
 		}
 	}
+}
+
+void
+_dispatch_event_loop_wake_owner(dispatch_sync_context_t dsc,
+		dispatch_wlh_t wlh, uint64_t old_state, uint64_t new_state)
+{
+	(void)dsc; (void)wlh; (void)old_state; (void)new_state;
+}
+
+void
+_dispatch_event_loop_wait_for_ownership(dispatch_sync_context_t dsc)
+{
+	if (dsc->dsc_release_storage) {
+		_dispatch_queue_release_storage(dsc->dc_data);
+	}
+}
+
+void
+_dispatch_event_loop_end_ownership(dispatch_wlh_t wlh, uint64_t old_state,
+		uint64_t new_state, uint32_t flags)
+{
+	(void)wlh; (void)old_state; (void)new_state; (void)flags;
+}
+
+#if DISPATCH_WLH_DEBUG
+void
+_dispatch_event_loop_assert_not_owned(dispatch_wlh_t wlh)
+{
+	(void)wlh;
+}
+#endif
+
+void
+_dispatch_event_loop_leave_immediate(dispatch_wlh_t wlh, uint64_t dq_state)
+{
+	(void)wlh; (void)dq_state;
 }
 
 #endif // DISPATCH_EVENT_BACKEND_EPOLL

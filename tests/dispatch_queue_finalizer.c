@@ -19,7 +19,9 @@
  */
 
 #include <dispatch/dispatch.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +32,7 @@
 
 void *ctxt_magic = NULL;
 
-void
+static void
 finalize(void *ctxt)
 {
 	test_ptr_null("finalizer ran", NULL);
@@ -38,7 +40,7 @@ finalize(void *ctxt)
 	test_stop();
 }
 
-void
+static void
 never_call(void *ctxt)
 {
 	test_ptr_notnull("never_call should not run", NULL);
@@ -50,10 +52,14 @@ main(void)
 {
 	dispatch_test_start("Dispatch Queue Finalizer");
 
-#ifdef __LP64__
+#if HAS_ARC4RANDOM
+#if defined(__LP64__) || defined(_WIN64)
 	ctxt_magic = (void*)((uintptr_t)arc4random() << 32 | arc4random());
 #else
 	ctxt_magic = (void*)arc4random();
+#endif
+#else // that is, if !HAS_ARC4RANDOM
+    ctxt_magic = (void *)random();
 #endif
 
 	// we need a non-NULL value for the tests to work properly

@@ -18,14 +18,16 @@
  * @APPLE_APACHE_LICENSE_HEADER_END@
  */
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 // for asprintf
 #define _GNU_SOURCE 1
 #endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <errno.h>
 #include <sys/errno.h>
 #include <sys/wait.h>
@@ -154,7 +156,7 @@ _test_uint32(const char* file, long line, const char* desc, uint32_t actual, uin
 }
 
 void
-test_uint32_format(long actual, long expected, const char *format, ...)
+test_uint32_format(uint32_t actual, uint32_t expected, const char *format, ...)
 {
 	GENERATE_DESC
 	_test_uint32(NULL, 0, desc, actual, expected);
@@ -186,6 +188,20 @@ test_long_format(long actual, long expected, const char* format, ...)
 {
 	GENERATE_DESC
 	_test_long(NULL, 0, desc, actual, expected);
+}
+
+void
+_test_sizet(const char* file, long line, const char* desc, size_t actual, size_t expected)
+{
+	_test_print(file, line, desc,
+		(actual == expected), "%zd", actual, "%zd", expected);
+}
+
+void
+test_sizet_format(size_t actual, size_t expected, const char* format, ...)
+{
+	GENERATE_DESC
+	_test_sizet(NULL, 0, desc, actual, expected);
 }
 
 void
@@ -256,6 +272,32 @@ test_long_greater_than_or_equal_format(long actual, long expected_max, const cha
 }
 
 void
+_test_sizet_less_than(const char* file, long line, const char* desc, size_t actual, size_t expected_max)
+{
+	_test_print(file, line, desc, (actual < expected_max), "%zd", actual, "<%zd", expected_max);
+}
+
+void
+test_sizet_less_than_format(size_t actual, size_t expected_max, const char* format, ...)
+{
+	GENERATE_DESC
+	_test_sizet_less_than(NULL, 0, desc, actual, expected_max);
+}
+
+void
+_test_sizet_less_than_or_equal(const char* file, long line, const char* desc, size_t actual, size_t expected_max)
+{
+	_test_print(file, line, desc, (actual <= expected_max), "%zd", actual, "<=%zd", expected_max);
+}
+
+void
+test_sizet_less_than_or_equal_format(size_t actual, size_t expected_max, const char* format, ...)
+{
+	GENERATE_DESC
+	_test_sizet_less_than_or_equal(NULL, 0, desc, actual, expected_max);
+}
+
+void
 _test_double_less_than(const char* file, long line, const char* desc, double val, double max_expected)
 {
 	_test_print(file, line, desc, (val < max_expected), "%f", val, "<%f", max_expected);
@@ -284,7 +326,10 @@ test_double_less_than_or_equal_format(double val, double max_expected, const cha
 void
 _test_double_equal(const char* file, long line, const char* desc, double val, double expected)
 {
+	#pragma clang diagnostic push
+	#pragma clang diagnostic ignored "-Wfloat-equal"
 	_test_print(file, line, desc, (val == expected), "%f", val, "%f", expected);
+	#pragma clang diagnostic pop
 }
 
 
@@ -296,12 +341,12 @@ test_double_equal_format(double val, double expected, const char *format, ...)
 }
 
 void
-_test_errno(const char* file, long line, const char* desc, long actual, long expected)
+_test_errno(const char* file, long line, const char* desc, int actual, int expected)
 {
 	char* actual_str;
 	char* expected_str;
-	asprintf(&actual_str, "%ld\t%s", actual, actual ? strerror(actual) : "");
-	asprintf(&expected_str, "%ld\t%s", expected, expected ? strerror(expected) : "");
+	asprintf(&actual_str, "%d\t%s", actual, actual ? strerror(actual) : "");
+	asprintf(&expected_str, "%d\t%s", expected, expected ? strerror(expected) : "");
 	_test_print(file, line, desc,
 		(actual == expected), "%s", actual_str, "%s", expected_str);
 	free(actual_str);
@@ -309,7 +354,7 @@ _test_errno(const char* file, long line, const char* desc, long actual, long exp
 }
 
 void
-test_errno_format(long actual, long expected, const char *format, ...)
+test_errno_format(int actual, int expected, const char *format, ...)
 {
 	GENERATE_DESC
 	_test_errno(NULL, 0, desc, actual, expected);
@@ -409,7 +454,7 @@ test_start(const char* desc)
 	usleep(100000);	// give 'gdb --waitfor=' a chance to find this proc
 }
 
-#if __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 static char** get_environment(void)
 {
 	extern char **environ; 
@@ -477,7 +522,7 @@ void
 test_stop_after_delay(void *delay)
 {
 	if (delay != NULL) {
-		sleep((int)(intptr_t)delay);
+		sleep((uint)(intptr_t)delay);
 	}
 
 	test_leaks(NULL);

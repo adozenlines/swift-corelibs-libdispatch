@@ -21,6 +21,8 @@
 // Contains exported global data and initialization & other routines that must
 // only exist once in the shared library even when resolvers are used.
 
+// NOTE: this file must not contain any atomic operations
+
 #include "internal.h"
 
 #if HAVE_MACH
@@ -35,7 +37,7 @@ DISPATCH_NOTHROW __attribute__((constructor))
 void
 _libdispatch_init(void);
 
-DISPATCH_EXPORT DISPATCH_NOTHROW
+DISPATCH_NOTHROW
 void
 _libdispatch_init(void)
 {
@@ -43,6 +45,7 @@ _libdispatch_init(void)
 }
 #endif
 
+#if !defined(_WIN32)
 DISPATCH_EXPORT DISPATCH_NOTHROW
 void
 dispatch_atfork_prepare(void)
@@ -72,6 +75,30 @@ dispatch_atfork_child(void)
 	_dispatch_unsafe_fork = 0;
 }
 
+int
+_dispatch_sigmask(void)
+{
+	sigset_t mask;
+	int r = 0;
+
+	/* Workaround: 6269619 Not all signals can be delivered on any thread */
+	r |= sigfillset(&mask);
+	r |= sigdelset(&mask, SIGILL);
+	r |= sigdelset(&mask, SIGTRAP);
+#if HAVE_DECL_SIGEMT
+	r |= sigdelset(&mask, SIGEMT);
+#endif
+	r |= sigdelset(&mask, SIGFPE);
+	r |= sigdelset(&mask, SIGBUS);
+	r |= sigdelset(&mask, SIGSEGV);
+	r |= sigdelset(&mask, SIGSYS);
+	r |= sigdelset(&mask, SIGPIPE);
+	r |= sigdelset(&mask, SIGPROF);
+	r |= pthread_sigmask(SIG_BLOCK, &mask, NULL);
+	return dispatch_assume_zero(r);
+}
+#endif
+
 #pragma mark -
 #pragma mark dispatch_globals
 
@@ -86,7 +113,11 @@ void (*_dispatch_end_NSAutoReleasePool)(void *);
 
 #if DISPATCH_USE_THREAD_LOCAL_STORAGE
 __thread struct dispatch_tsd __dispatch_tsd;
+#if defined(_WIN32)
+DWORD __dispatch_tsd_key;
+#else
 pthread_key_t __dispatch_tsd_key;
+#endif
 #elif !DISPATCH_USE_DIRECT_TSD
 pthread_key_t dispatch_queue_key;
 pthread_key_t dispatch_frame_key;
@@ -123,10 +154,6 @@ int _dispatch_set_qos_class_enabled;
 #if DISPATCH_USE_KEVENT_WORKQUEUE && DISPATCH_USE_MGR_THREAD
 int _dispatch_kevent_workqueue_enabled;
 #endif
-#if DISPATCH_USE_EVFILT_MACHPORT_DIRECT && \
-		DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-int _dispatch_evfilt_machport_direct_enabled;
-#endif
 
 DISPATCH_HW_CONFIG();
 uint8_t _dispatch_unsafe_fork;
@@ -148,33 +175,6 @@ bool
 _dispatch_is_fork_of_multithreaded_parent(void)
 {
 	return _dispatch_child_of_unsafe_fork;
-}
-
-DISPATCH_NOINLINE
-void
-_dispatch_fork_becomes_unsafe_slow(void)
-{
-	uint8_t value = os_atomic_or(&_dispatch_unsafe_fork,
-			_DISPATCH_UNSAFE_FORK_MULTITHREADED, relaxed);
-	if (value & _DISPATCH_UNSAFE_FORK_PROHIBIT) {
-		DISPATCH_CLIENT_CRASH(0, "Transition to multithreaded is prohibited");
-	}
-}
-
-DISPATCH_NOINLINE
-void
-_dispatch_prohibit_transition_to_multithreaded(bool prohibit)
-{
-	if (prohibit) {
-		uint8_t value = os_atomic_or(&_dispatch_unsafe_fork,
-				_DISPATCH_UNSAFE_FORK_PROHIBIT, relaxed);
-		if (value & _DISPATCH_UNSAFE_FORK_MULTITHREADED) {
-			DISPATCH_CLIENT_CRASH(0, "The executable is already multithreaded");
-		}
-	} else {
-		os_atomic_and(&_dispatch_unsafe_fork,
-				(uint8_t)~_DISPATCH_UNSAFE_FORK_PROHIBIT, relaxed);
-	}
 }
 
 const struct dispatch_queue_offsets_s dispatch_queue_offsets = {
@@ -215,10 +215,10 @@ struct dispatch_queue_s _dispatch_main_q = {
 	.do_targetq = &_dispatch_root_queues[
 			DISPATCH_ROOT_QUEUE_IDX_DEFAULT_QOS_OVERCOMMIT],
 #endif
-	.dq_state = DISPATCH_QUEUE_STATE_INIT_VALUE(1),
+	.dq_state = DISPATCH_QUEUE_STATE_INIT_VALUE(1) |
+			DISPATCH_QUEUE_ROLE_BASE_ANON,
 	.dq_label = "com.apple.main-thread",
 	.dq_atomic_flags = DQF_THREAD_BOUND | DQF_CANNOT_TRYSYNC | DQF_WIDTH(1),
-	.dq_wlh = DISPATCH_WLH_GLOBAL, // TODO: main thread wlh
 	.dq_serialnum = 1,
 };
 
@@ -403,6 +403,7 @@ DISPATCH_VTABLE_SUBCLASS_INSTANCE(queue_root, queue,
 	.do_debug = dispatch_queue_debug,
 );
 
+
 DISPATCH_VTABLE_SUBCLASS_INSTANCE(queue_main, queue,
 	.do_type = DISPATCH_QUEUE_SERIAL_TYPE,
 	.do_kind = "main-queue",
@@ -426,7 +427,7 @@ DISPATCH_VTABLE_SUBCLASS_INSTANCE(queue_runloop, queue,
 DISPATCH_VTABLE_SUBCLASS_INSTANCE(queue_mgr, queue,
 	.do_type = DISPATCH_QUEUE_MGR_TYPE,
 	.do_kind = "mgr-queue",
-	.do_push = _dispatch_queue_push,
+	.do_push = _dispatch_mgr_queue_push,
 	.do_invoke = _dispatch_mgr_thread,
 	.do_wakeup = _dispatch_mgr_queue_wakeup,
 	.do_debug = dispatch_queue_debug,
@@ -491,6 +492,7 @@ DISPATCH_VTABLE_INSTANCE(data,
 	.do_kind = "data",
 	.do_dispose = _dispatch_data_dispose,
 	.do_debug = _dispatch_data_debug,
+	.do_set_targetq = (void*)_dispatch_data_set_target_queue,
 );
 #endif
 
@@ -527,6 +529,41 @@ _dispatch_vtable_init(void)
 			offsetof(struct dispatch_semaphore_vtable_s, _os_obj_vtable));
 #endif // USE_OBJC
 }
+
+#pragma mark -
+#pragma mark dispatch_data globals
+
+const dispatch_block_t _dispatch_data_destructor_free = ^{
+	DISPATCH_INTERNAL_CRASH(0, "free destructor called");
+};
+
+const dispatch_block_t _dispatch_data_destructor_none = ^{
+	DISPATCH_INTERNAL_CRASH(0, "none destructor called");
+};
+
+#if !HAVE_MACH
+const dispatch_block_t _dispatch_data_destructor_munmap = ^{
+	DISPATCH_INTERNAL_CRASH(0, "munmap destructor called");
+};
+#else
+// _dispatch_data_destructor_munmap is a linker alias to the following
+const dispatch_block_t _dispatch_data_destructor_vm_deallocate = ^{
+	DISPATCH_INTERNAL_CRASH(0, "vmdeallocate destructor called");
+};
+#endif
+
+const dispatch_block_t _dispatch_data_destructor_inline = ^{
+	DISPATCH_INTERNAL_CRASH(0, "inline destructor called");
+};
+
+struct dispatch_data_s _dispatch_data_empty = {
+#if DISPATCH_DATA_IS_BRIDGED_TO_NSDATA
+	.do_vtable = DISPATCH_DATA_EMPTY_CLASS,
+#else
+	DISPATCH_GLOBAL_OBJECT_HEADER(data),
+	.do_next = DISPATCH_OBJECT_LISTLESS,
+#endif
+};
 
 #pragma mark -
 #pragma mark dispatch_bug
@@ -659,26 +696,57 @@ _dispatch_logv_init(void *context DISPATCH_UNUSED)
 			log_to_file = true;
 		} else if (strcmp(e, "stderr") == 0) {
 			log_to_file = true;
+#if defined(_WIN32)
+			dispatch_logfile = _fileno(stderr);
+#else
 			dispatch_logfile = STDERR_FILENO;
+#endif
 		}
 	}
 	if (!dispatch_log_disabled) {
 		if (log_to_file && dispatch_logfile == -1) {
+#if defined(_WIN32)
+			char path[MAX_PATH + 1] = {0};
+			DWORD dwLength = GetTempPathA(MAX_PATH, path);
+			dispatch_assert(dwLength <= MAX_PATH + 1);
+			snprintf(&path[dwLength], MAX_PATH - dwLength, "libdispatch.%d.log",
+					GetCurrentProcessId());
+			dispatch_logfile = _open(path, O_WRONLY | O_APPEND | O_CREAT, 0666);
+#else
 			char path[PATH_MAX];
 			snprintf(path, sizeof(path), "/var/tmp/libdispatch.%d.log",
 					getpid());
 			dispatch_logfile = open(path, O_WRONLY | O_APPEND | O_CREAT |
 					O_NOFOLLOW | O_CLOEXEC, 0666);
+#endif
 		}
 		if (dispatch_logfile != -1) {
 			struct timeval tv;
+#if defined(_WIN32)
+			DWORD dwTime = GetTickCount();
+			tv.tv_sec = dwTime / 1000;
+			tv.tv_usec = 1000 * (dwTime % 1000);
+#else
 			gettimeofday(&tv, NULL);
+#endif
 #if DISPATCH_DEBUG
 			dispatch_log_basetime = _dispatch_absolute_time();
 #endif
+#if defined(_WIN32)
+			FILE *pLogFile = _fdopen(dispatch_logfile, "w");
+
+			char szProgramName[MAX_PATH + 1] = {0};
+			GetModuleFileNameA(NULL, szProgramName, MAX_PATH);
+
+			fprintf(pLogFile, "=== log file opened for %s[%lu] at "
+					"%ld.%06u ===\n", szProgramName, GetCurrentProcessId(),
+					tv.tv_sec, (int)tv.tv_usec);
+			fclose(pLogFile);
+#else
 			dprintf(dispatch_logfile, "=== log file opened for %s[%u] at "
 					"%ld.%06u ===\n", getprogname() ?: "", getpid(),
 					tv.tv_sec, (int)tv.tv_usec);
+#endif
 		}
 	}
 }
@@ -690,7 +758,12 @@ _dispatch_log_file(char *buf, size_t len)
 
 	buf[len++] = '\n';
 retry:
+#if defined(_WIN32)
+	dispatch_assert(len <= UINT_MAX);
+	r = _write(dispatch_logfile, buf, (unsigned int)len);
+#else
 	r = write(dispatch_logfile, buf, len);
+#endif
 	if (slowpath(r == -1) && errno == EINTR) {
 		goto retry;
 	}
@@ -706,7 +779,7 @@ _dispatch_logv_file(const char *msg, va_list ap)
 
 #if DISPATCH_DEBUG
 	offset += dsnprintf(&buf[offset], bufsiz - offset, "%llu\t",
-			_dispatch_absolute_time() - dispatch_log_basetime);
+			(unsigned long long)_dispatch_absolute_time() - dispatch_log_basetime);
 #endif
 	r = vsnprintf(&buf[offset], bufsiz - offset, msg, ap);
 	if (r < 0) return;
@@ -733,6 +806,36 @@ _dispatch_vsyslog(const char *msg, va_list ap)
 		_dispatch_syslog(str);
 		free(str);
 	}
+}
+#elif defined(_WIN32)
+static inline void
+_dispatch_syslog(const char *msg)
+{
+  OutputDebugStringA(msg);
+}
+
+static inline void
+_dispatch_vsyslog(const char *msg, va_list ap)
+{
+  va_list argp;
+
+  va_copy(argp, ap);
+
+  int length = _vscprintf(msg, ap);
+  if (length == -1)
+    return;
+
+  char *buffer = malloc((size_t)length + 1);
+  if (buffer == NULL)
+    return;
+
+  _vsnprintf(buffer, (size_t)length + 1, msg, argp);
+
+  va_end(argp);
+
+  _dispatch_syslog(buffer);
+
+  free(buffer);
 }
 #else // DISPATCH_USE_SIMPLE_ASL
 static inline void
@@ -803,7 +906,7 @@ _dispatch_debugv(dispatch_object_t dou, const char *msg, va_list ap)
 	int r;
 #if DISPATCH_DEBUG && !DISPATCH_USE_OS_DEBUG_LOG
 	offset += dsnprintf(&buf[offset], bufsiz - offset, "%llu\t\t%p\t",
-			_dispatch_absolute_time() - dispatch_log_basetime,
+			(unsigned long long)_dispatch_absolute_time() - dispatch_log_basetime,
 			(void *)_dispatch_thread_self());
 #endif
 	if (dou._do) {
@@ -866,6 +969,7 @@ void
 _dispatch_temporary_resource_shortage(void)
 {
 	sleep(1);
+	__asm__ __volatile__("");  // prevent tailcall
 }
 
 void *
@@ -1124,16 +1228,17 @@ _dispatch_autorelease_pool_pop(void *pool)
 	}
 }
 
-void*
-_dispatch_last_resort_autorelease_pool_push(void)
+void
+_dispatch_last_resort_autorelease_pool_push(dispatch_invoke_context_t dic)
 {
-	return _dispatch_autorelease_pool_push();
+	dic->dic_autorelease_pool = _dispatch_autorelease_pool_push();
 }
 
 void
-_dispatch_last_resort_autorelease_pool_pop(void *pool)
+_dispatch_last_resort_autorelease_pool_pop(dispatch_invoke_context_t dic)
 {
-	_dispatch_autorelease_pool_pop(pool);
+	_dispatch_autorelease_pool_pop(dic->dic_autorelease_pool);
+	dic->dic_autorelease_pool = NULL;
 }
 
 #endif // DISPATCH_COCOA_COMPAT
@@ -1176,22 +1281,16 @@ kern_return_t
 _dispatch_mach_notify_port_destroyed(mach_port_t notify DISPATCH_UNUSED,
 		mach_port_t name)
 {
-	kern_return_t kr;
-	// this function should never be called
-	(void)dispatch_assume_zero(name);
-	kr = mach_port_mod_refs(mach_task_self(), name, MACH_PORT_RIGHT_RECEIVE,-1);
-	DISPATCH_VERIFY_MIG(kr);
-	(void)dispatch_assume_zero(kr);
-	return KERN_SUCCESS;
+	DISPATCH_INTERNAL_CRASH(name, "unexpected receipt of port-destroyed");
+	return KERN_FAILURE;
 }
 
 kern_return_t
-_dispatch_mach_notify_no_senders(mach_port_t notify,
-		mach_port_mscount_t mscnt DISPATCH_UNUSED)
+_dispatch_mach_notify_no_senders(mach_port_t notify DISPATCH_UNUSED,
+		mach_port_mscount_t mscnt)
 {
-	// this function should never be called
-	(void)dispatch_assume_zero(notify);
-	return KERN_SUCCESS;
+	DISPATCH_INTERNAL_CRASH(mscnt, "unexpected receipt of no-more-senders");
+	return KERN_FAILURE;
 }
 
 kern_return_t

@@ -21,14 +21,16 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <sys/stat.h>
 #include <dispatch/dispatch.h>
 
 #include "dispatch_test.h"
 #include <bsdtests.h>
 
-static size_t actual;
+static ssize_t actual;
 
 void stage1(int stage);
 void stage2(void);
@@ -49,13 +51,13 @@ stage1(int stage)
 	dispatch_queue_t main_q = dispatch_get_main_queue();
 	test_ptr_notnull("main_q", main_q);
 
-	dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, main_q);
+	dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, main_q);
 	test_ptr_notnull("select source", source);
 
 	dispatch_source_set_event_handler(source, ^{
 		size_t buffer_size = 500*1024;
 		char buffer[500*1024];
-		size_t sz = read(fd, buffer, buffer_size);
+		ssize_t sz = read(fd, buffer, buffer_size);
 		test_double_less_than_or_equal("kevent read 1", sz, buffer_size+1);
 		dispatch_source_cancel(source);
 	});
@@ -109,25 +111,24 @@ stage2(void)
 		exit(EXIT_FAILURE);
 	}
 
-	size_t expected = sb.st_size;
+	ssize_t expected = sb.st_size;
 	actual = 0;
 
 	dispatch_queue_t main_q = dispatch_get_main_queue();
 	test_ptr_notnull("main_q", main_q);
 
-	dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, main_q);
+	dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, main_q);
 	test_ptr_notnull("kevent source", source);
 
 	dispatch_source_set_event_handler(source, ^{
 		size_t est = dispatch_source_get_data(source);
 		test_double_less_than_or_equal("estimated", est, expected - actual);
-		size_t buffer_size = 500*1024;
 		char buffer[500*1024];
-		size_t sz = read(fd, buffer, buffer_size);
+		ssize_t sz = read(fd, buffer, sizeof(buffer));
 		actual += sz;
-		if (sz < buffer_size)
+		if (sz < (ssize_t)sizeof(buffer))
 		{
-			sz = read(fd, buffer, buffer_size);
+			sz = read(fd, buffer, sizeof(buffer));
 			actual += sz;
 			test_long("EOF", sz, 0);
 			dispatch_source_cancel(source);

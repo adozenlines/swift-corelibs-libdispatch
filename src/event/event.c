@@ -46,9 +46,10 @@ _dispatch_unote_create(dispatch_source_type_t dst,
 		du = _dispatch_unote_linkage_get_unote(dul)._du;
 	}
 	du->du_type = dst;
+	du->du_can_be_wlh = dst->dst_per_trigger_qos;
 	du->du_ident = (uint32_t)handle;
 	du->du_filter = dst->dst_filter;
-	du->du_fflags = (typeof(du->du_fflags))mask;
+	du->du_fflags = (__typeof__(du->du_fflags))mask;
 	if (dst->dst_flags & EV_UDATA_SPECIFIC) {
 		du->du_is_direct = true;
 	}
@@ -108,8 +109,13 @@ _dispatch_unote_dispose(dispatch_unote_t du)
 	}
 #endif
 	if (du._du->du_is_timer) {
-		if (du._dt->dt_pending_config) {
+		if (unlikely(du._dt->dt_heap_entry[DTH_TARGET_ID] != DTH_INVALID_ID ||
+				du._dt->dt_heap_entry[DTH_DEADLINE_ID] != DTH_INVALID_ID)) {
+			DISPATCH_INTERNAL_CRASH(0, "Disposing of timer still in its heap");
+		}
+		if (unlikely(du._dt->dt_pending_config)) {
 			free(du._dt->dt_pending_config);
+			du._dt->dt_pending_config = NULL;
 		}
 	} else if (!du._du->du_is_direct) {
 		ptr = _dispatch_unote_get_linkage(du);
@@ -280,6 +286,8 @@ _dispatch_source_timer_create(dispatch_source_type_t dst,
 		du._dt->dt_timer.target = UINT64_MAX;
 		du._dt->dt_timer.deadline = UINT64_MAX;
 		du._dt->dt_timer.interval = UINT64_MAX;
+		du._dt->dt_heap_entry[DTH_TARGET_ID] = DTH_INVALID_ID;
+		du._dt->dt_heap_entry[DTH_DEADLINE_ID] = DTH_INVALID_ID;
 	}
 	return du;
 }

@@ -19,7 +19,9 @@
  */
 
 #include <dispatch/dispatch.h>
+#if !USE_WIN32_SEM
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #include <assert.h>
 
@@ -31,7 +33,7 @@
 int
 main(void)
 {
-	static size_t total;
+	static long total;
 	dispatch_semaphore_t dsema;
 
 	dispatch_test_start("Dispatch Semaphore");

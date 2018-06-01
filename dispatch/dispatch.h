@@ -23,32 +23,26 @@
 
 #ifdef __APPLE__
 #include <Availability.h>
+#include <os/availability.h>
 #include <TargetConditionals.h>
-#else
-#ifndef API_AVAILABLE
-#define API_AVAILABLE(...)
+#include <os/base.h>
+#elif defined(_WIN32)
+#include <os/generic_win_base.h>
+#elif defined(__unix__)
+#include <os/generic_unix_base.h>
 #endif
-#ifndef API_DEPRECATED
-#define API_DEPRECATED(...)
-#endif
-#ifndef API_UNAVAILABLE
-#define API_UNAVAILABLE(...)
-#endif
-#ifndef API_DEPRECATED_WITH_REPLACEMENT
-#define API_DEPRECATED_WITH_REPLACEMENT(...)
-#endif
-#endif // __APPLE__
 
-#include <sys/cdefs.h>
 #include <sys/types.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <fcntl.h>
 
-#if defined(__linux__) && defined(__has_feature)
+#if (defined(__linux__) || defined(__FreeBSD__)) && defined(__has_feature)
 #if __has_feature(modules)
 #if !defined(__arm__)
 #include <stdio.h> // for off_t (to match Glibc.modulemap)
@@ -56,7 +50,7 @@
 #endif
 #endif
 
-#define DISPATCH_API_VERSION 20160831
+#define DISPATCH_API_VERSION 20170124
 
 #ifndef __DISPATCH_BUILDING_DISPATCH__
 

@@ -5,8 +5,8 @@
  *
  * Licensed under Apache License v2.0 with Runtime Library Exception
  *
- * See http://swift.org/LICENSE.txt for license information
- * See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+ * See https://swift.org/LICENSE.txt for license information
+ * See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
  *
  */
 
@@ -20,12 +20,6 @@
 #define TAILQ_FOREACH_SAFE(var, head, field, temp)                         \
 	for ((var) = TAILQ_FIRST((head));                                      \
 		(var) && ((temp) = TAILQ_NEXT((var), field), 1); (var) = (temp))
-#endif
-
-#if DISPATCH_DEBUG
-#ifndef TRASHIT
-#define TRASHIT(x) do { (x) = (void *)-1; } while (0)
-#endif
 #endif
 
 /*

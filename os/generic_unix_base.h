@@ -5,15 +5,40 @@
  *
  * Licensed under Apache License v2.0 with Runtime Library Exception
  *
- * See http://swift.org/LICENSE.txt for license information
- * See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+ * See https://swift.org/LICENSE.txt for license information
+ * See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
  *
  */
 
-#ifndef __OS_LINUX_BASE__
-#define __OS_LINUX_BASE__
+#ifndef __OS_GENERIC_UNIX_BASE__
+#define __OS_GENERIC_UNIX_BASE__
 
+#if __has_include(<sys/sysmacros.h>)
+#include <sys/sysmacros.h>
+#endif
+
+#if defined(__FreeBSD__)
+#include <libutil.h>
+#include <fcntl.h>
+#endif
 #include <sys/param.h>
+
+#if __has_include(<sys/cdefs.h>)
+#include <sys/cdefs.h>
+#endif
+
+#ifndef API_AVAILABLE
+#define API_AVAILABLE(...)
+#endif
+#ifndef API_DEPRECATED
+#define API_DEPRECATED(...)
+#endif
+#ifndef API_UNAVAILABLE
+#define API_UNAVAILABLE(...)
+#endif
+#ifndef API_DEPRECATED_WITH_REPLACEMENT
+#define API_DEPRECATED_WITH_REPLACEMENT(...)
+#endif
 
 #if __GNUC__
 #define OS_EXPECT(x, v) __builtin_expect((x), (v))
@@ -100,4 +125,4 @@ enum { __VA_ARGS__ }; typedef _type _name##_t
 #endif
 #define OS_NOTHROW
 
-#endif /* __OS_LINUX_BASE__ */
+#endif /* __OS_GENERIC_UNIX_BASE__ */

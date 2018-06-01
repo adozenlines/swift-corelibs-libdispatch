@@ -29,20 +29,47 @@
 #	include <sys/event.h>
 #	define DISPATCH_EVENT_BACKEND_EPOLL 0
 #	define DISPATCH_EVENT_BACKEND_KEVENT 1
+#elif defined(_WIN32)
+#	define DISPATCH_EVENT_BACKEND_EPOLL 0
+#	define DISPATCH_EVENT_BACKEND_KEVENT 0
 #else
 #	error unsupported event loop
 #endif
 
 #if DISPATCH_DEBUG
 #define DISPATCH_MGR_QUEUE_DEBUG 1
+#define DISPATCH_WLH_DEBUG 1
 #endif
 
 #ifndef DISPATCH_MGR_QUEUE_DEBUG
 #define DISPATCH_MGR_QUEUE_DEBUG 0
 #endif
 
+#ifndef DISPATCH_WLH_DEBUG
+#define DISPATCH_WLH_DEBUG 0
+#endif
+
 #ifndef DISPATCH_MACHPORT_DEBUG
 #define DISPATCH_MACHPORT_DEBUG 0
+#endif
+
+#ifndef DISPATCH_TIMER_ASSERTIONS
+#if DISPATCH_DEBUG
+#define DISPATCH_TIMER_ASSERTIONS 1
+#else
+#define DISPATCH_TIMER_ASSERTIONS 0
+#endif
+#endif
+
+#if DISPATCH_TIMER_ASSERTIONS
+#define DISPATCH_TIMER_ASSERT(a, op, b, text) ({ \
+		__typeof__(a) _a = (a); \
+		if (unlikely(!(_a op (b)))) { \
+			DISPATCH_CLIENT_CRASH(_a, "Timer: " text); \
+		} \
+	})
+#else
+#define DISPATCH_TIMER_ASSERT(a, op, b, text) ((void)0)
 #endif
 
 #ifndef EV_VANISHED
@@ -52,14 +79,12 @@
 #if DISPATCH_EVENT_BACKEND_KEVENT
 #	if defined(EV_SET_QOS)
 #		define DISPATCH_USE_KEVENT_QOS 1
-#		ifndef KEVENT_FLAG_IMMEDIATE
-#		define KEVENT_FLAG_IMMEDIATE 0x001
-#		endif
-#		ifndef KEVENT_FLAG_ERROR_EVENTS
-#		define KEVENT_FLAG_ERROR_EVENTS 0x002
-#		endif
 #	else
 #		define DISPATCH_USE_KEVENT_QOS 0
+#	endif
+
+#	ifndef KEVENT_FLAG_ERROR_EVENTS
+#		define KEVENT_FLAG_ERROR_EVENTS 0x002
 #	endif
 
 #	ifdef NOTE_LEEWAY
@@ -82,6 +107,14 @@
 #	define NOTE_FUNLOCK 0x00000100
 #	endif
 
+// FreeBSD's kevent does not support those
+#	ifndef NOTE_ABSOLUTE
+#	define NOTE_ABSOLUTE 0
+#	endif
+#	ifndef NOTE_EXITSTATUS
+#	define NOTE_EXITSTATUS 0
+#	endif
+
 #	if HAVE_DECL_NOTE_REAP
 #	if defined(NOTE_REAP) && defined(__APPLE__)
 #	undef NOTE_REAP
@@ -101,29 +134,9 @@
 #	undef HAVE_DECL_VQ_DESIRED_DISK
 #	endif // VQ_DESIRED_DISK
 
-#	ifndef NOTE_MEMORYSTATUS_LOW_SWAP
-#	define NOTE_MEMORYSTATUS_LOW_SWAP 0x8
-#	endif
-
-#	if !defined(NOTE_MEMORYSTATUS_PROC_LIMIT_WARN) || \
-		!DISPATCH_MIN_REQUIRED_OSX_AT_LEAST(101200)
-#	undef NOTE_MEMORYSTATUS_PROC_LIMIT_WARN
-#	define NOTE_MEMORYSTATUS_PROC_LIMIT_WARN 0
-#	endif // NOTE_MEMORYSTATUS_PROC_LIMIT_WARN
-
-#	if !defined(NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL) || \
-		!DISPATCH_MIN_REQUIRED_OSX_AT_LEAST(101200)
-#	undef NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL
-#	define NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL 0
-#	endif // NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL
-
-#	ifndef DISPATCH_KEVENT_TREAT_ENOENT_AS_EINPROGRESS
-#	if TARGET_OS_MAC && !DISPATCH_MIN_REQUIRED_OSX_AT_LEAST(101200)
-	// deferred delete can return bogus ENOENTs on older kernels
-#	define DISPATCH_KEVENT_TREAT_ENOENT_AS_EINPROGRESS 1
-#	else
-#	define DISPATCH_KEVENT_TREAT_ENOENT_AS_EINPROGRESS 0
-#	endif
+#	if !defined(EVFILT_NW_CHANNEL) && defined(__APPLE__)
+#	define EVFILT_NW_CHANNEL       (-16)
+#	define NOTE_FLOW_ADV_UPDATE    	0x1
 #	endif
 #else // DISPATCH_EVENT_BACKEND_KEVENT
 #	define EV_ADD					0x0001
@@ -142,8 +155,14 @@
 
 #	define DISPATCH_HAVE_TIMER_QOS 0
 #	define DISPATCH_HAVE_TIMER_COALESCING 0
-#	define KEVENT_FLAG_IMMEDIATE 0x001
 #endif // !DISPATCH_EVENT_BACKEND_KEVENT
+
+// These flags are used by dispatch generic code and
+// translated back by the various backends to similar semantics
+// hence must be defined even on non Darwin platforms
+#ifndef KEVENT_FLAG_IMMEDIATE
+#	define KEVENT_FLAG_IMMEDIATE 0x001
+#endif
 
 #ifdef EV_UDATA_SPECIFIC
 #	define DISPATCH_EV_DIRECT		(EV_UDATA_SPECIFIC|EV_DISPATCH)
@@ -194,6 +213,14 @@
 typedef unsigned int mach_msg_priority_t;
 #	define MACH_MSG_PRIORITY_UNSPECIFIED ((mach_msg_priority_t)0)
 #	endif // MACH_SEND_OVERRIDE
+
+#	ifndef MACH_SEND_SYNC_OVERRIDE
+#	define MACH_SEND_SYNC_OVERRIDE 0x00100000
+#	endif // MACH_SEND_SYNC_OVERRIDE
+
+#	ifndef MACH_RCV_SYNC_WAIT
+#	define MACH_RCV_SYNC_WAIT 0x00004000
+#	endif // MACH_RCV_SYNC_WAIT
 
 #	define DISPATCH_MACH_TRAILER_SIZE sizeof(dispatch_mach_trailer_t)
 #	define DISPATCH_MACH_RCV_TRAILER MACH_RCV_TRAILER_CTX

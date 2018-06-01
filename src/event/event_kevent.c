@@ -30,6 +30,9 @@
 #endif
 
 #define DISPATCH_KEVENT_MUXED_MARKER  1ul
+#define DISPATCH_MACH_AUDIT_TOKEN_PID (5)
+
+#define dispatch_kevent_udata_t  __typeof__(((dispatch_kevent_t)NULL)->udata)
 
 typedef struct dispatch_muxnote_s {
 	TAILQ_ENTRY(dispatch_muxnote_s) dmn_list;
@@ -38,6 +41,7 @@ typedef struct dispatch_muxnote_s {
 	dispatch_kevent_s dmn_kev;
 } *dispatch_muxnote_t;
 
+static bool _dispatch_timers_force_max_leeway;
 static int _dispatch_kq = -1;
 static struct {
 	dispatch_once_t pred;
@@ -57,8 +61,13 @@ DISPATCH_CACHELINE_ALIGN
 static TAILQ_HEAD(dispatch_muxnote_bucket_s, dispatch_muxnote_s)
 _dispatch_sources[DSL_HASH_SIZE];
 
+#if defined(__APPLE__)
 #define DISPATCH_NOTE_CLOCK_WALL NOTE_MACH_CONTINUOUS_TIME
 #define DISPATCH_NOTE_CLOCK_MACH 0
+#else
+#define DISPATCH_NOTE_CLOCK_WALL 0
+#define DISPATCH_NOTE_CLOCK_MACH 0
+#endif
 
 static const uint32_t _dispatch_timer_index_to_fflags[] = {
 #define DISPATCH_TIMER_FFLAGS_INIT(kind, qos, note) \
@@ -77,7 +86,6 @@ static const uint32_t _dispatch_timer_index_to_fflags[] = {
 };
 
 static void _dispatch_kevent_timer_drain(dispatch_kevent_t ke);
-static void _dispatch_kevent_poke_drain(dispatch_kevent_t ke);
 
 #pragma mark -
 #pragma mark kevent debug
@@ -190,17 +198,20 @@ dispatch_kevent_debug(const char *verb, const dispatch_kevent_s *kev,
 	_dispatch_debug("%s kevent[%p] %s= { ident = 0x%llx, filter = %s, "
 			"flags = %s (0x%x), fflags = 0x%x, data = 0x%llx, udata = 0x%llx, "
 			"qos = 0x%x, ext[0] = 0x%llx, ext[1] = 0x%llx, ext[2] = 0x%llx, "
-			"ext[3] = 0x%llx }: %s #%u", verb, kev, i_n, kev->ident,
-			_evfiltstr(kev->filter), _evflagstr(kev->flags, flagstr,
-			sizeof(flagstr)), kev->flags, kev->fflags, kev->data, kev->udata,
-			kev->qos, kev->ext[0], kev->ext[1], kev->ext[2], kev->ext[3],
+			"ext[3] = 0x%llx }: %s #%u", verb, kev, i_n,
+			(unsigned long long)kev->ident, _evfiltstr(kev->filter),
+			_evflagstr(kev->flags, flagstr, sizeof(flagstr)), kev->flags, kev->fflags,
+			(unsigned long long)kev->data, (unsigned long long)kev->udata, kev->qos,
+			kev->ext[0], kev->ext[1], kev->ext[2], kev->ext[3],
 			function, line);
 #else
 	_dispatch_debug("%s kevent[%p] %s= { ident = 0x%llx, filter = %s, "
 			"flags = %s (0x%x), fflags = 0x%x, data = 0x%llx, udata = 0x%llx}: "
 			"%s #%u", verb, kev, i_n,
-			kev->ident, _evfiltstr(kev->filter), _evflagstr(kev->flags, flagstr,
-			sizeof(flagstr)), kev->flags, kev->fflags, kev->data, kev->udata,
+			(unsigned long long)kev->ident, _evfiltstr(kev->filter),
+			_evflagstr(kev->flags, flagstr, sizeof(flagstr)), kev->flags,
+			kev->fflags, (unsigned long long)kev->data,
+			(unsigned long long)kev->udata,
 			function, line);
 #endif
 }
@@ -220,7 +231,12 @@ dispatch_kevent_debug(const char *verb, const dispatch_kevent_s *kev,
 #define _dispatch_kevent_mgr_debug(verb, kev) _dispatch_kevent_debug(verb, kev)
 #else
 #define _dispatch_kevent_mgr_debug(verb, kev) ((void)verb, (void)kev)
-#endif
+#endif // DISPATCH_MGR_QUEUE_DEBUG
+#if DISPATCH_WLH_DEBUG
+#define _dispatch_kevent_wlh_debug(verb, kev) _dispatch_kevent_debug(verb, kev)
+#else
+#define _dispatch_kevent_wlh_debug(verb, kev)  ((void)verb, (void)kev)
+#endif // DISPATCH_WLH_DEBUG
 
 #if DISPATCH_MACHPORT_DEBUG
 #ifndef MACH_PORT_TYPE_SPREQUEST
@@ -305,9 +321,6 @@ _dispatch_kevent_mach_msg_size(dispatch_kevent_t ke)
 	return (mach_msg_size_t)ke->ext[1];
 }
 
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-static void _dispatch_mach_kevent_portset_drain(dispatch_kevent_t ke);
-#endif
 static void _dispatch_kevent_mach_msg_drain(dispatch_kevent_t ke);
 static inline void _dispatch_mach_host_calendar_change_register(void);
 
@@ -331,10 +344,17 @@ _dispatch_kevent_get_muxnote(dispatch_kevent_t ke)
 }
 
 DISPATCH_ALWAYS_INLINE
+static inline bool
+_dispatch_kevent_unote_is_muxed(dispatch_kevent_t ke)
+{
+	return ((uintptr_t)ke->udata) & DISPATCH_KEVENT_MUXED_MARKER;
+}
+
+DISPATCH_ALWAYS_INLINE
 static dispatch_unote_t
 _dispatch_kevent_get_unote(dispatch_kevent_t ke)
 {
-	dispatch_assert((ke->udata & DISPATCH_KEVENT_MUXED_MARKER) == 0);
+	dispatch_assert(_dispatch_kevent_unote_is_muxed(ke) == false);
 	return (dispatch_unote_t){ ._du = (dispatch_unote_class_t)ke->udata };
 }
 
@@ -342,24 +362,18 @@ DISPATCH_NOINLINE
 static void
 _dispatch_kevent_print_error(dispatch_kevent_t ke)
 {
-	dispatch_kevent_t kev = NULL;
-
+	_dispatch_debug("kevent[0x%llx]: handling error",
+			(unsigned long long)ke->udata);
 	if (ke->flags & EV_DELETE) {
 		if (ke->flags & EV_UDATA_SPECIFIC) {
 			if (ke->data == EINPROGRESS) {
 				// deferred EV_DELETE
 				return;
 			}
-#if DISPATCH_KEVENT_TREAT_ENOENT_AS_EINPROGRESS
-			if (ke->data == ENOENT) {
-				// deferred EV_DELETE
-				return;
-			}
-#endif
 		}
 		// for EV_DELETE if the update was deferred we may have reclaimed
 		// the udata already, and it is unsafe to dereference it now.
-	} else if (ke->udata & DISPATCH_KEVENT_MUXED_MARKER) {
+	} else if (_dispatch_kevent_unote_is_muxed(ke)) {
 		ke->flags |= _dispatch_kevent_get_muxnote(ke)->dmn_kev.flags;
 	} else if (ke->udata) {
 		if (!_dispatch_unote_registered(_dispatch_kevent_get_unote(ke))) {
@@ -369,8 +383,7 @@ _dispatch_kevent_print_error(dispatch_kevent_t ke)
 
 #if HAVE_MACH
 	if (ke->filter == EVFILT_MACHPORT && ke->data == ENOTSUP &&
-			(ke->flags & EV_ADD) && _dispatch_evfilt_machport_direct_enabled &&
-			kev && (kev->fflags & MACH_RCV_MSG)) {
+			(ke->flags & EV_ADD) && (ke->fflags & MACH_RCV_MSG)) {
 		DISPATCH_INTERNAL_CRASH(ke->ident,
 				"Missing EVFILT_MACHPORT support for ports");
 	}
@@ -438,7 +451,7 @@ _dispatch_kevent_drain(dispatch_kevent_t ke)
 {
 	if (ke->filter == EVFILT_USER) {
 		_dispatch_kevent_mgr_debug("received", ke);
-		return _dispatch_kevent_poke_drain(ke);
+		return;
 	}
 	_dispatch_kevent_debug("received", ke);
 	if (unlikely(ke->flags & EV_ERROR)) {
@@ -452,8 +465,6 @@ _dispatch_kevent_drain(dispatch_kevent_t ke)
 			ke->data = 0;
 			_dispatch_kevent_debug("synthetic NOTE_EXIT", ke);
 		} else {
-			_dispatch_debug("kevent[0x%llx]: handling error",
-					(unsigned long long)ke->udata);
 			return _dispatch_kevent_print_error(ke);
 		}
 	}
@@ -463,18 +474,13 @@ _dispatch_kevent_drain(dispatch_kevent_t ke)
 
 #if HAVE_MACH
 	if (ke->filter == EVFILT_MACHPORT) {
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-		if (ke->udata == 0) {
-			return _dispatch_mach_kevent_portset_drain(ke);
-		}
-#endif
 		if (_dispatch_kevent_mach_msg_size(ke)) {
 			return _dispatch_kevent_mach_msg_drain(ke);
 		}
 	}
 #endif
 
-	if (ke->udata & DISPATCH_KEVENT_MUXED_MARKER) {
+	if (_dispatch_kevent_unote_is_muxed(ke)) {
 		return _dispatch_kevent_merge_muxed(ke);
 	}
 	return _dispatch_kevent_merge(_dispatch_kevent_get_unote(ke), ke);
@@ -491,7 +497,7 @@ _dispatch_kq_create(const void *guard_ptr)
 		.ident = 1,
 		.filter = EVFILT_USER,
 		.flags = EV_ADD|EV_CLEAR,
-		.udata = (uintptr_t)DISPATCH_WLH_MANAGER,
+		.udata = (dispatch_kevent_udata_t)DISPATCH_WLH_MANAGER,
 	};
 	int kqfd;
 
@@ -533,31 +539,30 @@ _dispatch_kq_create(const void *guard_ptr)
 #endif
 
 static void
-_dispatch_kq_init(void *context DISPATCH_UNUSED)
+_dispatch_kq_init(void *context)
 {
+	bool *kq_initialized = context;
+
 	_dispatch_fork_becomes_unsafe();
+	if (unlikely(getenv("LIBDISPATCH_TIMERS_FORCE_MAX_LEEWAY"))) {
+		_dispatch_timers_force_max_leeway = true;
+	}
+	*kq_initialized = true;
+
 #if DISPATCH_USE_KEVENT_WORKQUEUE
 	_dispatch_kevent_workqueue_init();
 	if (_dispatch_kevent_workqueue_enabled) {
 		int r;
 		int kqfd = _dispatch_kq;
-		const dispatch_kevent_s kev[] = {
-			[0] = {
-				.ident = 1,
-				.filter = EVFILT_USER,
-				.flags = EV_ADD|EV_CLEAR,
-				.qos = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
-				.udata = (uintptr_t)DISPATCH_WLH_MANAGER,
-			},
-			[1] = {
-				.ident = 1,
-				.filter = EVFILT_USER,
-				.fflags = NOTE_TRIGGER,
-				.udata = (uintptr_t)DISPATCH_WLH_MANAGER,
-			},
+		const dispatch_kevent_s ke = {
+			.ident = 1,
+			.filter = EVFILT_USER,
+			.flags = EV_ADD|EV_CLEAR,
+			.qos = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
+			.udata = (dispatch_kevent_udata_t)DISPATCH_WLH_MANAGER,
 		};
 retry:
-		r = kevent_qos(kqfd, kev, 2, NULL, 0, NULL, NULL,
+		r = kevent_qos(kqfd, &ke, 1, NULL, 0, NULL, NULL,
 				KEVENT_FLAG_WORKQ|KEVENT_FLAG_IMMEDIATE);
 		if (unlikely(r == -1)) {
 			int err = errno;
@@ -579,88 +584,119 @@ retry:
 #endif // DISPATCH_USE_MGR_THREAD
 }
 
+#if DISPATCH_USE_MEMORYPRESSURE_SOURCE
+static void _dispatch_memorypressure_init(void);
+#else
+#define _dispatch_memorypressure_init() ((void)0)
+#endif
+
 DISPATCH_NOINLINE
 static int
-_dispatch_kq_update(dispatch_wlh_t wlh, dispatch_kevent_t ke, int n,
+_dispatch_kq_poll(dispatch_wlh_t wlh, dispatch_kevent_t ke, int n,
+		dispatch_kevent_t ke_out, int n_out, void *buf, size_t *avail,
 		uint32_t flags)
 {
 	static dispatch_once_t pred;
-	dispatch_once_f(&pred, NULL, _dispatch_kq_init);
+	bool kq_initialized = false;
+	int r = 0;
 
-	dispatch_kevent_s ke_out[DISPATCH_DEFERRED_ITEMS_EVENT_COUNT];
-	int i, out_n = countof(ke_out), r = 0;
-#if DISPATCH_USE_KEVENT_QOS
-	size_t size, *avail = NULL;
-	void *buf = NULL;
-#endif
-
-#if DISPATCH_DEBUG
-	dispatch_assert(wlh);
-	dispatch_assert((size_t)n <= countof(ke_out));
-	for (i = 0; i < n; i++) {
-		if (ke[i].filter != EVFILT_USER || DISPATCH_MGR_QUEUE_DEBUG) {
-			_dispatch_kevent_debug_n(NULL, ke + i, i, n);
-		}
+	dispatch_once_f(&pred, &kq_initialized, _dispatch_kq_init);
+	if (unlikely(kq_initialized)) {
+		// The calling thread was the one doing the initialization
+		//
+		// The event loop needs the memory pressure source and debug channel,
+		// however creating these will recursively call _dispatch_kq_poll(),
+		// so we can't quite initialize them under the dispatch once.
+		_dispatch_memorypressure_init();
+		_voucher_activity_debug_channel_init();
 	}
-#endif
 
-	wlh = DISPATCH_WLH_GLOBAL;
 
-	if (flags & KEVENT_FLAG_ERROR_EVENTS) {
 #if !DISPATCH_USE_KEVENT_QOS
+	if (flags & KEVENT_FLAG_ERROR_EVENTS) {
 		// emulate KEVENT_FLAG_ERROR_EVENTS
-		for (i = 0; i < n; i++) {
-			ke[i].flags |= EV_RECEIPT;
+		for (r = 0; r < n; r++) {
+			ke[r].flags |= EV_RECEIPT;
 		}
-		out_n = n;
-#endif
-	} else {
-#if DISPATCH_USE_KEVENT_QOS
-		size = DISPATCH_MACH_RECEIVE_MAX_INLINE_MESSAGE_SIZE +
-				DISPATCH_MACH_TRAILER_SIZE;
-		buf = alloca(size);
-		avail = &size;
-#endif
+		n_out = n;
 	}
+#endif
 
 retry:
-	_dispatch_clear_return_to_kernel();
-	if (wlh == DISPATCH_WLH_GLOBAL) {
+	if (wlh == DISPATCH_WLH_ANON) {
 		int kqfd = _dispatch_kq;
 #if DISPATCH_USE_KEVENT_QOS
 		if (_dispatch_kevent_workqueue_enabled) {
 			flags |= KEVENT_FLAG_WORKQ;
 		}
-		r = kevent_qos(kqfd, ke, n, ke_out, out_n, buf, avail, flags);
+		r = kevent_qos(kqfd, ke, n, ke_out, n_out, buf, avail, flags);
 #else
+		(void)buf;
+		(void)avail;
 		const struct timespec timeout_immediately = {}, *timeout = NULL;
 		if (flags & KEVENT_FLAG_IMMEDIATE) timeout = &timeout_immediately;
-		r = kevent(kqfd, ke, n, ke_out, out_n, timeout);
+		r = kevent(kqfd, ke, n, ke_out, n_out, timeout);
 #endif
 	}
 	if (unlikely(r == -1)) {
 		int err = errno;
 		switch (err) {
+		case ENOMEM:
+			_dispatch_temporary_resource_shortage();
+			/* FALLTHROUGH */
 		case EINTR:
 			goto retry;
 		case EBADF:
 			DISPATCH_CLIENT_CRASH(err, "Do not close random Unix descriptors");
-			break;
 		default:
-			(void)dispatch_assume_zero(err);
-			break;
+			DISPATCH_CLIENT_CRASH(err, "Unexpected error from kevent");
 		}
-		return err;
 	}
+	return r;
+}
 
-	if (flags & KEVENT_FLAG_ERROR_EVENTS) {
-		for (i = 0, n = r, r = 0; i < n; i++) {
-			if ((ke_out[i].flags & EV_ERROR) && (r = (int)ke_out[i].data)) {
+DISPATCH_NOINLINE
+static int
+_dispatch_kq_drain(dispatch_wlh_t wlh, dispatch_kevent_t ke, int n,
+		uint32_t flags)
+{
+	dispatch_kevent_s ke_out[DISPATCH_DEFERRED_ITEMS_EVENT_COUNT];
+	bool poll_for_events = !(flags & KEVENT_FLAG_ERROR_EVENTS);
+	int i, n_out = countof(ke_out), r = 0;
+	size_t *avail = NULL;
+	void *buf = NULL;
+
+#if DISPATCH_USE_KEVENT_QOS
+	size_t size;
+	if (poll_for_events) {
+		size = DISPATCH_MACH_RECEIVE_MAX_INLINE_MESSAGE_SIZE +
+				DISPATCH_MACH_TRAILER_SIZE;
+		buf = alloca(size);
+		avail = &size;
+	}
+#endif
+
+#if DISPATCH_DEBUG
+	for (r = 0; r < n; r++) {
+		if (ke[r].filter != EVFILT_USER || DISPATCH_MGR_QUEUE_DEBUG) {
+			_dispatch_kevent_debug_n(NULL, ke + r, r, n);
+		}
+	}
+#endif
+
+	if (poll_for_events) _dispatch_clear_return_to_kernel();
+	n = _dispatch_kq_poll(wlh, ke, n, ke_out, n_out, buf, avail, flags);
+	if (n == 0) {
+		r = 0;
+	} else if (flags & KEVENT_FLAG_ERROR_EVENTS) {
+		for (i = 0, r = 0; i < n; i++) {
+			if ((ke_out[i].flags & EV_ERROR) && ke_out[i].data) {
 				_dispatch_kevent_drain(&ke_out[i]);
+				r = (int)ke_out[i].data;
 			}
 		}
 	} else {
-		for (i = 0, n = r, r = 0; i < n; i++) {
+		for (i = 0, r = 0; i < n; i++) {
 			_dispatch_kevent_drain(&ke_out[i]);
 		}
 	}
@@ -671,7 +707,7 @@ DISPATCH_ALWAYS_INLINE
 static inline int
 _dispatch_kq_update_one(dispatch_wlh_t wlh, dispatch_kevent_t ke)
 {
-	return _dispatch_kq_update(wlh, ke, 1,
+	return _dispatch_kq_drain(wlh, ke, 1,
 			KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS);
 }
 
@@ -679,7 +715,7 @@ DISPATCH_ALWAYS_INLINE
 static inline void
 _dispatch_kq_update_all(dispatch_wlh_t wlh, dispatch_kevent_t ke, int n)
 {
-	(void)_dispatch_kq_update(wlh, ke, n,
+	(void)_dispatch_kq_drain(wlh, ke, n,
 			KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS);
 }
 
@@ -700,19 +736,20 @@ _dispatch_kq_unote_set_kevent(dispatch_unote_t _du, dispatch_kevent_t dk,
 		.ident  = du->du_ident,
 		.filter = dst->dst_filter,
 		.flags  = flags,
-		.udata  = (uintptr_t)du,
+		.udata  = (dispatch_kevent_udata_t)du,
 		.fflags = du->du_fflags | dst->dst_fflags,
-		.data   = (typeof(dk->data))dst->dst_data,
+		.data   = (__typeof__(dk->data))dst->dst_data,
 #if DISPATCH_USE_KEVENT_QOS
-		.qos    = (typeof(dk->qos))pp,
+		.qos    = (__typeof__(dk->qos))pp,
 #endif
 	};
+	(void)pp; // if DISPATCH_USE_KEVENT_QOS == 0
 }
 
 DISPATCH_ALWAYS_INLINE
 static inline int
 _dispatch_kq_deferred_find_slot(dispatch_deferred_items_t ddi,
-		int16_t filter, uint64_t ident, uint64_t udata)
+		int16_t filter, uint64_t ident, dispatch_kevent_udata_t udata)
 {
 	dispatch_kevent_t events = ddi->ddi_eventlist;
 	int i;
@@ -731,8 +768,8 @@ static inline dispatch_kevent_t
 _dispatch_kq_deferred_reuse_slot(dispatch_wlh_t wlh,
 		dispatch_deferred_items_t ddi, int slot)
 {
-	if (wlh != DISPATCH_WLH_GLOBAL) _dispatch_set_return_to_kernel();
-	if (unlikely(slot == countof(ddi->ddi_eventlist))) {
+	if (wlh != DISPATCH_WLH_ANON) _dispatch_set_return_to_kernel();
+	if (unlikely(slot == ddi->ddi_maxevents)) {
 		int nevents = ddi->ddi_nevents;
 		ddi->ddi_nevents = 1;
 		_dispatch_kq_update_all(wlh, ddi->ddi_eventlist, nevents);
@@ -762,13 +799,13 @@ _dispatch_kq_deferred_update(dispatch_wlh_t wlh, dispatch_kevent_t ke)
 {
 	dispatch_deferred_items_t ddi = _dispatch_deferred_items_get();
 
-	if (ddi && wlh == _dispatch_get_wlh()) {
+	if (ddi && ddi->ddi_maxevents && wlh == _dispatch_get_wlh()) {
 		int slot = _dispatch_kq_deferred_find_slot(ddi, ke->filter, ke->ident,
 				ke->udata);
 		dispatch_kevent_t dk = _dispatch_kq_deferred_reuse_slot(wlh, ddi, slot);
 		*dk = *ke;
-		if (ke->filter != EVFILT_USER || DISPATCH_MGR_QUEUE_DEBUG) {
-			_dispatch_kevent_debug("deferred", ke);
+		if (ke->filter != EVFILT_USER) {
+			_dispatch_kevent_mgr_debug("deferred", ke);
 		}
 	} else {
 		_dispatch_kq_update_one(wlh, ke);
@@ -800,13 +837,15 @@ _dispatch_kq_unote_update(dispatch_wlh_t wlh, dispatch_unote_t _du,
 
 	if (action_flags & EV_ADD) {
 		// as soon as we register we may get an event delivery and it has to
-		// see this bit already set, else it will not unregister the kevent
+		// see du_wlh already set, else it will not unregister the kevent
+		dispatch_assert(du->du_wlh == NULL);
+		_dispatch_wlh_retain(wlh);
 		du->du_wlh = wlh;
 	}
 
 	if (ddi && wlh == _dispatch_get_wlh()) {
 		int slot = _dispatch_kq_deferred_find_slot(ddi,
-				du->du_filter, du->du_ident, (uintptr_t)du);
+				du->du_filter, du->du_ident, (dispatch_kevent_udata_t)du);
 		if (slot < ddi->ddi_nevents) {
 			// <rdar://problem/26202376> when deleting and an enable is pending,
 			// we must merge EV_ENABLE to do an immediate deletion
@@ -834,6 +873,7 @@ _dispatch_kq_unote_update(dispatch_wlh_t wlh, dispatch_unote_t _du,
 done:
 	if (action_flags & EV_ADD) {
 		if (unlikely(r)) {
+			_dispatch_wlh_release(du->du_wlh);
 			du->du_wlh = NULL;
 		}
 		return r == 0;
@@ -842,11 +882,8 @@ done:
 	if (action_flags & EV_DELETE) {
 		if (r == EINPROGRESS) {
 			return false;
-#if DISPATCH_KEVENT_TREAT_ENOENT_AS_EINPROGRESS
-		} else if (r == ENOENT) {
-			return false;
-#endif
 		}
+		_dispatch_wlh_release(du->du_wlh);
 		du->du_wlh = NULL;
 	}
 
@@ -907,14 +944,16 @@ _dispatch_muxnote_find(struct dispatch_muxnote_bucket_s *dmb,
 #define _dispatch_unote_muxnote_find(dmb, du, wlh) \
 		_dispatch_muxnote_find(dmb, wlh, du._du->du_ident, du._du->du_filter)
 
+#if HAVE_MACH
 DISPATCH_ALWAYS_INLINE
 static inline dispatch_muxnote_t
 _dispatch_mach_muxnote_find(mach_port_t name, int16_t filter)
 {
 	struct dispatch_muxnote_bucket_s *dmb;
 	dmb = _dispatch_muxnote_bucket(name, filter);
-	return _dispatch_muxnote_find(dmb, DISPATCH_WLH_GLOBAL, name, filter);
+	return _dispatch_muxnote_find(dmb, DISPATCH_WLH_ANON, name, filter);
 }
+#endif
 
 DISPATCH_NOINLINE
 static bool
@@ -944,7 +983,8 @@ _dispatch_unote_register_muxed(dispatch_unote_t du, dispatch_wlh_t wlh)
 #if DISPATCH_USE_KEVENT_QOS
 		dmn->dmn_kev.qos = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG;
 #endif
-		dmn->dmn_kev.udata = (uintptr_t)dmn | DISPATCH_KEVENT_MUXED_MARKER;
+		dmn->dmn_kev.udata = (dispatch_kevent_udata_t)((uintptr_t)dmn |
+				DISPATCH_KEVENT_MUXED_MARKER);
 		dmn->dmn_wlh = wlh;
 		if (unlikely(du._du->du_type->dst_update_mux)) {
 			installed = du._du->du_type->dst_update_mux(dmn);
@@ -967,11 +1007,13 @@ _dispatch_unote_register_muxed(dispatch_unote_t du, dispatch_wlh_t wlh)
 		TAILQ_INSERT_TAIL(&dmn->dmn_unotes_head, dul, du_link);
 		dul->du_muxnote = dmn;
 
+#if HAVE_MACH
 		if (du._du->du_filter == DISPATCH_EVFILT_MACH_NOTIFICATION) {
 			bool armed = DISPATCH_MACH_NOTIFICATION_ARMED(&dmn->dmn_kev);
 			os_atomic_store2o(du._dmsr, dmsr_notification_armed, armed,relaxed);
 		}
-		du._du->du_wlh = DISPATCH_WLH_GLOBAL;
+		du._du->du_wlh = DISPATCH_WLH_ANON;
+#endif
 	}
 	return installed;
 }
@@ -986,11 +1028,11 @@ _dispatch_unote_register(dispatch_unote_t du, dispatch_wlh_t wlh,
 	case DISPATCH_EVFILT_CUSTOM_ADD:
 	case DISPATCH_EVFILT_CUSTOM_OR:
 	case DISPATCH_EVFILT_CUSTOM_REPLACE:
-		du._du->du_wlh = wlh;
+		du._du->du_wlh = DISPATCH_WLH_ANON;
 		return true;
 	}
 	if (!du._du->du_is_direct) {
-		return _dispatch_unote_register_muxed(du, DISPATCH_WLH_GLOBAL);
+		return _dispatch_unote_register_muxed(du, DISPATCH_WLH_ANON);
 	}
 	return _dispatch_kq_unote_update(wlh, du, EV_ADD | EV_ENABLE);
 }
@@ -1021,9 +1063,13 @@ _dispatch_unote_unregister_muxed(dispatch_unote_t du, uint32_t flags)
 	dispatch_muxnote_t dmn = dul->du_muxnote;
 	bool update = false, dispose = false;
 
+#if HAVE_MACH
 	if (dmn->dmn_kev.filter == DISPATCH_EVFILT_MACH_NOTIFICATION) {
 		os_atomic_store2o(du._dmsr, dmsr_notification_armed, false, relaxed);
 	}
+#endif
+
+	dispatch_assert(du._du->du_wlh == DISPATCH_WLH_ANON);
 	du._du->du_wlh = NULL;
 	TAILQ_REMOVE(&dmn->dmn_unotes_head, dul, du_link);
 	_TAILQ_TRASH_ENTRY(dul, du_link);
@@ -1090,14 +1136,7 @@ _dispatch_unote_unregister(dispatch_unote_t du, uint32_t flags)
 }
 
 #pragma mark -
-#pragma mark dispatch_loop
-
-#if DISPATCH_USE_MEMORYPRESSURE_SOURCE
-static void _dispatch_memorypressure_init(void);
-#else
-#define _dispatch_memorypressure_init()
-#endif
-static bool _dispatch_timers_force_max_leeway;
+#pragma mark dispatch_event_loop
 
 void
 _dispatch_event_loop_atfork_child(void)
@@ -1108,45 +1147,23 @@ _dispatch_event_loop_atfork_child(void)
 #endif
 }
 
-DISPATCH_NOINLINE
-void
-_dispatch_event_loop_init(void)
-{
-	if (unlikely(getenv("LIBDISPATCH_TIMERS_FORCE_MAX_LEEWAY"))) {
-		_dispatch_timers_force_max_leeway = true;
-	}
-	_dispatch_memorypressure_init();
-	_voucher_activity_debug_channel_init();
-}
 
 DISPATCH_NOINLINE
 void
-_dispatch_event_loop_poke(dispatch_wlh_t wlh, dispatch_priority_t pri,
-		uint32_t flags)
+_dispatch_event_loop_poke(dispatch_wlh_t wlh, uint64_t dq_state, uint32_t flags)
 {
 	if (wlh == DISPATCH_WLH_MANAGER) {
-		dispatch_assert(!flags);
-		dispatch_kevent_s ke = {
+		dispatch_kevent_s ke = (dispatch_kevent_s){
 			.ident  = 1,
 			.filter = EVFILT_USER,
 			.fflags = NOTE_TRIGGER,
-			.udata = (uintptr_t)DISPATCH_WLH_MANAGER,
+			.udata = (dispatch_kevent_udata_t)DISPATCH_WLH_MANAGER,
 		};
-		return _dispatch_kq_deferred_update(DISPATCH_WLH_GLOBAL, &ke);
-	} else if (wlh && wlh != DISPATCH_WLH_GLOBAL) {
-		dispatch_assert(flags);
-		dispatch_assert(pri);
+		return _dispatch_kq_deferred_update(DISPATCH_WLH_ANON, &ke);
+	} else if (wlh && wlh != DISPATCH_WLH_ANON) {
+		(void)dq_state; (void)flags;
 	}
 	DISPATCH_INTERNAL_CRASH(wlh, "Unsupported wlh configuration");
-}
-
-DISPATCH_NOINLINE
-static void
-_dispatch_kevent_poke_drain(dispatch_kevent_t ke)
-{
-	dispatch_assert(ke->filter == EVFILT_USER);
-	dispatch_wlh_t wlh = (dispatch_wlh_t)ke->udata;
-	dispatch_assert(wlh);
 }
 
 DISPATCH_NOINLINE
@@ -1155,29 +1172,92 @@ _dispatch_event_loop_drain(uint32_t flags)
 {
 	dispatch_wlh_t wlh = _dispatch_get_wlh();
 	dispatch_deferred_items_t ddi = _dispatch_deferred_items_get();
-	int n = ddi->ddi_nevents;
-	ddi->ddi_nevents = 0;
-	_dispatch_kq_update(wlh, ddi->ddi_eventlist, n, flags);
-}
+	int n;
 
-void
-_dispatch_event_loop_update(void)
-{
-	dispatch_wlh_t wlh = _dispatch_get_wlh();
-	dispatch_deferred_items_t ddi = _dispatch_deferred_items_get();
-	int n = ddi->ddi_nevents;
+again:
+	n = ddi->ddi_nevents;
 	ddi->ddi_nevents = 0;
-	_dispatch_kq_update_all(wlh, ddi->ddi_eventlist, n);
-	dispatch_assert(ddi->ddi_nevents == 0);
-}
+	_dispatch_kq_drain(wlh, ddi->ddi_eventlist, n, flags);
 
-void
-_dispatch_event_loop_merge(dispatch_kevent_t ke, int n)
-{
-	while (n-- > 0) {
-		_dispatch_kevent_drain(ke++);
+	if ((flags & KEVENT_FLAG_IMMEDIATE) &&
+			!(flags & KEVENT_FLAG_ERROR_EVENTS) &&
+			_dispatch_needs_to_return_to_kernel()) {
+		goto again;
 	}
 }
+
+void
+_dispatch_event_loop_merge(dispatch_kevent_t events, int nevents)
+{
+	dispatch_deferred_items_t ddi = _dispatch_deferred_items_get();
+	dispatch_kevent_s kev[nevents];
+
+	// now we can re-use the whole event list, but we need to save one slot
+	// for the event loop poke
+	memcpy(kev, events, sizeof(kev));
+	ddi->ddi_maxevents = DISPATCH_DEFERRED_ITEMS_EVENT_COUNT - 1;
+
+	for (int i = 0; i < nevents; i++) {
+		_dispatch_kevent_drain(&kev[i]);
+	}
+
+	dispatch_wlh_t wlh = _dispatch_get_wlh();
+	if (wlh == DISPATCH_WLH_ANON && ddi->ddi_stashed_dou._do) {
+		if (ddi->ddi_nevents) {
+			// We will drain the stashed item and not return to the kernel
+			// right away. As a consequence, do not delay these updates.
+			_dispatch_event_loop_drain(KEVENT_FLAG_IMMEDIATE |
+					KEVENT_FLAG_ERROR_EVENTS);
+		}
+		_dispatch_trace_continuation_push(ddi->ddi_stashed_rq,
+				ddi->ddi_stashed_dou);
+	}
+}
+
+void
+_dispatch_event_loop_leave_immediate(dispatch_wlh_t wlh, uint64_t dq_state)
+{
+	(void)wlh; (void)dq_state;
+}
+
+void
+_dispatch_event_loop_leave_deferred(dispatch_wlh_t wlh, uint64_t dq_state)
+{
+	(void)wlh; (void)dq_state;
+}
+
+void
+_dispatch_event_loop_wake_owner(dispatch_sync_context_t dsc,
+		dispatch_wlh_t wlh, uint64_t old_state, uint64_t new_state)
+{
+	(void)dsc; (void)wlh; (void)old_state; (void)new_state;
+}
+
+void
+_dispatch_event_loop_wait_for_ownership(dispatch_sync_context_t dsc)
+{
+	if (dsc->dsc_release_storage) {
+		_dispatch_queue_release_storage(dsc->dc_data);
+	}
+}
+
+void
+_dispatch_event_loop_end_ownership(dispatch_wlh_t wlh, uint64_t old_state,
+		uint64_t new_state, uint32_t flags)
+{
+	(void)wlh; (void)old_state; (void)new_state; (void)flags;
+}
+
+#if DISPATCH_WLH_DEBUG
+void
+_dispatch_event_loop_assert_not_owned(dispatch_wlh_t wlh)
+{
+	(void)wlh;
+}
+#endif // DISPATCH_WLH_DEBUG
+
+#pragma mark -
+#pragma mark dispatch_event_loop timers
 
 #define DISPATCH_KEVENT_TIMEOUT_IDENT_MASK (~0ull << 8)
 
@@ -1210,7 +1290,7 @@ _dispatch_event_loop_timer_program(uint32_t tidx,
 		.flags = action | EV_ONESHOT,
 		.fflags = _dispatch_timer_index_to_fflags[tidx],
 		.data = (int64_t)target,
-		.udata = (uintptr_t)&_dispatch_timers_heap[tidx],
+		.udata = (dispatch_kevent_udata_t)&_dispatch_timers_heap[tidx],
 #if DISPATCH_HAVE_TIMER_COALESCING
 		.ext[1] = leeway,
 #endif
@@ -1218,8 +1298,9 @@ _dispatch_event_loop_timer_program(uint32_t tidx,
 		.qos = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
 #endif
 	};
+	(void)leeway; // if DISPATCH_HAVE_TIMER_COALESCING == 0
 
-	_dispatch_kq_deferred_update(DISPATCH_WLH_GLOBAL, &ke);
+	_dispatch_kq_deferred_update(DISPATCH_WLH_ANON, &ke);
 }
 
 void
@@ -1251,6 +1332,7 @@ _dispatch_event_loop_timer_delete(uint32_t tidx)
 	_dispatch_event_loop_timer_program(tidx, 0, 0, EV_DELETE);
 }
 
+#pragma mark -
 #pragma mark kevent specific sources
 
 static dispatch_unote_t
@@ -1355,6 +1437,17 @@ const dispatch_source_type_s _dispatch_source_type_sock = {
 };
 #endif // EVFILT_SOCK
 
+#ifdef EVFILT_NW_CHANNEL
+const dispatch_source_type_s _dispatch_source_type_nw_channel = {
+	.dst_kind       = "nw_channel",
+	.dst_filter     = EVFILT_NW_CHANNEL,
+	.dst_flags      = DISPATCH_EV_DIRECT|EV_CLEAR|EV_VANISHED,
+	.dst_mask       = NOTE_FLOW_ADV_UPDATE,
+	.dst_size       = sizeof(struct dispatch_source_refs_s),
+	.dst_create     = _dispatch_unote_create_with_fd,
+	.dst_merge_evt  = _dispatch_source_merge_evt,
+};
+#endif // EVFILT_NW_CHANNEL
 
 #if DISPATCH_USE_MEMORYSTATUS
 
@@ -1364,12 +1457,16 @@ const dispatch_source_type_s _dispatch_source_type_sock = {
 		DISPATCH_MEMORYPRESSURE_WARN | \
 		DISPATCH_MEMORYPRESSURE_CRITICAL | \
 		DISPATCH_MEMORYPRESSURE_PROC_LIMIT_WARN | \
-		DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL)
+		DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL | \
+		DISPATCH_MEMORYPRESSURE_MSL_STATUS)
+
 #define DISPATCH_MEMORYPRESSURE_MALLOC_MASK ( \
 		DISPATCH_MEMORYPRESSURE_WARN | \
 		DISPATCH_MEMORYPRESSURE_CRITICAL | \
 		DISPATCH_MEMORYPRESSURE_PROC_LIMIT_WARN | \
-		DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL)
+		DISPATCH_MEMORYPRESSURE_PROC_LIMIT_CRITICAL | \
+		DISPATCH_MEMORYPRESSURE_MSL_STATUS)
+
 
 static void
 _dispatch_memorypressure_handler(void *context)
@@ -1409,8 +1506,7 @@ _dispatch_memorypressure_init(void)
 {
 	dispatch_source_t ds = dispatch_source_create(
 			DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
-			DISPATCH_MEMORYPRESSURE_SOURCE_MASK,
-			_dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, true));
+			DISPATCH_MEMORYPRESSURE_SOURCE_MASK, &_dispatch_mgr_q);
 	dispatch_set_context(ds, ds);
 	dispatch_source_set_event_handler_f(ds, _dispatch_memorypressure_handler);
 	dispatch_activate(ds);
@@ -1460,7 +1556,8 @@ const dispatch_source_type_s _dispatch_source_type_memorypressure = {
 	.dst_mask       = NOTE_MEMORYSTATUS_PRESSURE_NORMAL
 			|NOTE_MEMORYSTATUS_PRESSURE_WARN|NOTE_MEMORYSTATUS_PRESSURE_CRITICAL
 			|NOTE_MEMORYSTATUS_LOW_SWAP|NOTE_MEMORYSTATUS_PROC_LIMIT_WARN
-			|NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL,
+			|NOTE_MEMORYSTATUS_PROC_LIMIT_CRITICAL
+			|NOTE_MEMORYSTATUS_MSL_STATUS,
 	.dst_size       = sizeof(struct dispatch_source_refs_s),
 
 #if TARGET_OS_SIMULATOR
@@ -1523,15 +1620,42 @@ _dispatch_timers_calendar_change(void)
 	}
 }
 
+static mach_msg_audit_trailer_t *
+_dispatch_mach_msg_get_audit_trailer(mach_msg_header_t *hdr)
+{
+	mach_msg_trailer_t *tlr = NULL;
+	mach_msg_audit_trailer_t *audit_tlr = NULL;
+	tlr = (mach_msg_trailer_t *)((unsigned char *)hdr +
+			round_msg(hdr->msgh_size));
+	// The trailer should always be of format zero.
+	if (tlr->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0) {
+		if (tlr->msgh_trailer_size >= sizeof(mach_msg_audit_trailer_t)) {
+			audit_tlr = (mach_msg_audit_trailer_t *)tlr;
+		}
+	}
+	return audit_tlr;
+}
+
 DISPATCH_NOINLINE
 static void
 _dispatch_mach_notify_source_invoke(mach_msg_header_t *hdr)
 {
 	mig_reply_error_t reply;
+	mach_msg_audit_trailer_t *tlr = NULL;
 	dispatch_assert(sizeof(mig_reply_error_t) == sizeof(union
 		__ReplyUnion___dispatch_libdispatch_internal_protocol_subsystem));
 	dispatch_assert(sizeof(mig_reply_error_t) <
 			DISPATCH_MACH_RECEIVE_MAX_INLINE_MESSAGE_SIZE);
+	tlr = _dispatch_mach_msg_get_audit_trailer(hdr);
+	if (!tlr) {
+		DISPATCH_INTERNAL_CRASH(0, "message received without expected trailer");
+	}
+	if (hdr->msgh_id <= MACH_NOTIFY_LAST
+			&& dispatch_assume_zero(tlr->msgh_audit.val[
+			DISPATCH_MACH_AUDIT_TOKEN_PID])) {
+		mach_msg_destroy(hdr);
+		return;
+	}
 	boolean_t success = libdispatch_internal_protocol_server(hdr, &reply.Head);
 	if (!success && reply.RetCode == MIG_BAD_ID &&
 			(hdr->msgh_id == HOST_CALENDAR_SET_REPLYID ||
@@ -1557,7 +1681,7 @@ _dispatch_mach_notify_port_init(void *context DISPATCH_UNUSED)
 	kern_return_t kr;
 #if HAVE_MACH_PORT_CONSTRUCT
 	mach_port_options_t opts = { .flags = MPO_CONTEXT_AS_GUARD | MPO_STRICT };
-#ifdef __LP64__
+#if DISPATCH_SIZEOF_PTR == 8
 	const mach_port_context_t guard = 0xfeed09071f1ca7edull;
 #else
 	const mach_port_context_t guard = 0xff1ca7edull;
@@ -1654,7 +1778,7 @@ _dispatch_mach_notify_update(dispatch_muxnote_t dmn, uint32_t new_flags,
 		mach_port_mscount_t notify_sync)
 {
 	mach_port_t previous, port = (mach_port_t)dmn->dmn_kev.ident;
-	typeof(dmn->dmn_kev.data) prev = dmn->dmn_kev.data;
+	__typeof__(dmn->dmn_kev.data) prev = dmn->dmn_kev.data;
 	kern_return_t kr, krr = 0;
 
 	// Update notification registration state.
@@ -1756,7 +1880,7 @@ _dispatch_mach_notify_merge(mach_port_t name, uint32_t data, bool final)
 
 	_dispatch_debug_machport(name);
 	dmn = _dispatch_mach_muxnote_find(name, DISPATCH_EVFILT_MACH_NOTIFICATION);
-	if (!dispatch_assume(dmn)) {
+	if (!dmn) {
 		return;
 	}
 
@@ -1832,11 +1956,13 @@ _dispatch_mach_notification_set_armed(dispatch_mach_send_refs_t dmsr)
 		return;
 	}
 
+#if HAVE_MACH
 	DISPATCH_MACH_NOTIFICATION_ARMED(&dmn->dmn_kev) = true;
 	TAILQ_FOREACH(dul, &dmn->dmn_unotes_head, du_link) {
 		du = _dispatch_unote_linkage_get_unote(dul);
 		os_atomic_store2o(du._dmsr, dmsr_notification_armed, true, relaxed);
 	}
+#endif
 }
 
 static dispatch_unote_t
@@ -1905,204 +2031,6 @@ const dispatch_source_type_s _dispatch_mach_type_send = {
 #pragma mark mach recv / reply
 #if HAVE_MACH
 
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-static mach_port_t _dispatch_mach_portset,  _dispatch_mach_recv_portset;
-static dispatch_kevent_s _dispatch_mach_recv_kevent;
-
-static void
-_dispatch_mach_portset_init(void *context DISPATCH_UNUSED)
-{
-	kern_return_t kr = mach_port_allocate(mach_task_self(),
-			MACH_PORT_RIGHT_PORT_SET, &_dispatch_mach_portset);
-	DISPATCH_VERIFY_MIG(kr);
-	if (unlikely(kr)) {
-		DISPATCH_CLIENT_CRASH(kr,
-				"mach_port_allocate() failed: cannot create port set");
-	}
-
-	dispatch_kevent_s kev = {
-		.filter = EVFILT_MACHPORT,
-		.flags  = EV_ADD|EV_ENABLE,
-		.ident  = _dispatch_mach_portset,
-		.qos    = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
-	};
-	_dispatch_kq_deferred_update(DISPATCH_WLH_GLOBAL, &kev);
-}
-
-static bool
-_dispatch_mach_portset_update(mach_port_t mp, mach_port_t mps)
-{
-	kern_return_t kr;
-
-	_dispatch_debug_machport(mp);
-	kr = mach_port_move_member(mach_task_self(), mp, mps);
-	if (unlikely(kr)) {
-		DISPATCH_VERIFY_MIG(kr);
-		switch (kr) {
-		case KERN_INVALID_RIGHT:
-			if (mps) {
-				_dispatch_bug_mach_client("_dispatch_kevent_machport_enable: "
-						"mach_port_move_member() failed ", kr);
-				break;
-			}
-			//fall through
-		case KERN_INVALID_NAME:
-#if DISPATCH_DEBUG
-			_dispatch_log("Corruption: Mach receive right 0x%x destroyed "
-					"prematurely", mp);
-#endif
-			break;
-		default:
-			(void)dispatch_assume_zero(kr);
-			break;
-		}
-	}
-	if (mps) {
-		return kr == KERN_SUCCESS;
-	}
-	return true;
-}
-
-static mach_port_t
-_dispatch_mach_get_portset(void)
-{
-	static dispatch_once_t pred;
-	dispatch_once_f(&pred, NULL, _dispatch_mach_portset_init);
-	return _dispatch_mach_portset;
-}
-
-static bool
-_dispatch_mach_recv_update_portset_mux(dispatch_muxnote_t dmn)
-{
-	mach_port_t mp = (mach_port_t)dmn->dmn_kev.ident;
-	mach_port_t mps = MACH_PORT_NULL;
-	if (!(dmn->dmn_kev.flags & EV_DELETE)) {
-		mps = _dispatch_mach_get_portset();
-	}
-	return _dispatch_mach_portset_update(mp, mps);
-}
-
-static void
-_dispatch_mach_recv_msg_buf_init(dispatch_kevent_t ke)
-{
-	mach_vm_size_t vm_size = mach_vm_round_page(
-			DISPATCH_MACH_RECEIVE_MAX_INLINE_MESSAGE_SIZE +
-			DISPATCH_MACH_TRAILER_SIZE);
-	mach_vm_address_t vm_addr = vm_page_size;
-	kern_return_t kr;
-
-	while (unlikely(kr = mach_vm_allocate(mach_task_self(), &vm_addr, vm_size,
-			VM_FLAGS_ANYWHERE))) {
-		if (kr != KERN_NO_SPACE) {
-			DISPATCH_CLIENT_CRASH(kr,
-					"Could not allocate mach msg receive buffer");
-		}
-		_dispatch_temporary_resource_shortage();
-		vm_addr = vm_page_size;
-	}
-	ke->ext[0] = (uintptr_t)vm_addr;
-	ke->ext[1] = vm_size;
-}
-
-static void
-_dispatch_mach_recv_portset_init(void *context DISPATCH_UNUSED)
-{
-	kern_return_t kr = mach_port_allocate(mach_task_self(),
-			MACH_PORT_RIGHT_PORT_SET, &_dispatch_mach_recv_portset);
-	DISPATCH_VERIFY_MIG(kr);
-	if (unlikely(kr)) {
-		DISPATCH_CLIENT_CRASH(kr,
-				"mach_port_allocate() failed: cannot create port set");
-	}
-
-	dispatch_assert(DISPATCH_MACH_TRAILER_SIZE ==
-			REQUESTED_TRAILER_SIZE_NATIVE(MACH_RCV_TRAILER_ELEMENTS(
-			DISPATCH_MACH_RCV_TRAILER)));
-
-	_dispatch_mach_recv_kevent = (dispatch_kevent_s){
-		.filter = EVFILT_MACHPORT,
-		.ident  = _dispatch_mach_recv_portset,
-		.flags  = EV_ADD|EV_ENABLE|EV_DISPATCH,
-		.fflags = DISPATCH_MACH_RCV_OPTIONS,
-		.qos    = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
-	};
-	if (!_dispatch_kevent_workqueue_enabled) {
-		_dispatch_mach_recv_msg_buf_init(&_dispatch_mach_recv_kevent);
-	}
-	_dispatch_kq_deferred_update(DISPATCH_WLH_GLOBAL,
-			&_dispatch_mach_recv_kevent);
-}
-
-static mach_port_t
-_dispatch_mach_get_recv_portset(void)
-{
-	static dispatch_once_t pred;
-	dispatch_once_f(&pred, NULL, _dispatch_mach_recv_portset_init);
-	return _dispatch_mach_recv_portset;
-}
-
-static bool
-_dispatch_mach_recv_direct_update_portset_mux(dispatch_muxnote_t dmn)
-{
-	mach_port_t mp = (mach_port_t)dmn->dmn_kev.ident;
-	mach_port_t mps = MACH_PORT_NULL;
-	if (!(dmn->dmn_kev.flags & EV_DELETE)) {
-		mps = _dispatch_mach_get_recv_portset();
-	}
-	return _dispatch_mach_portset_update(mp, mps);
-}
-
-static dispatch_unote_t
-_dispatch_mach_kevent_mach_recv_direct_find(mach_port_t name)
-{
-	dispatch_muxnote_t dmn;
-	dispatch_unote_linkage_t dul;
-
-	dmn = _dispatch_mach_muxnote_find(name, EVFILT_MACHPORT);
-	TAILQ_FOREACH(dul, &dmn->dmn_unotes_head, du_link) {
-		dispatch_unote_t du = _dispatch_unote_linkage_get_unote(dul);
-		if (du._du->du_type->dst_fflags & MACH_RCV_MSG) {
-			return du;
-		}
-	}
-	return DISPATCH_UNOTE_NULL;
-}
-
-DISPATCH_NOINLINE
-static void
-_dispatch_mach_kevent_portset_merge(dispatch_kevent_t ke)
-{
-	mach_port_t name = (mach_port_name_t)ke->data;
-	dispatch_unote_linkage_t dul, dul_next;
-	dispatch_muxnote_t dmn;
-
-	_dispatch_debug_machport(name);
-	dmn = _dispatch_mach_muxnote_find(name, EVFILT_MACHPORT);
-	if (!dispatch_assume(dmn)) {
-		return;
-	}
-	_dispatch_mach_portset_update(name, MACH_PORT_NULL); // emulate EV_DISPATCH
-
-	TAILQ_FOREACH_SAFE(dul, &dmn->dmn_unotes_head, du_link, dul_next) {
-		dispatch_unote_t du = _dispatch_unote_linkage_get_unote(dul);
-		dux_merge_evt(du._du, EV_ENABLE | EV_DISPATCH,
-				DISPATCH_MACH_RECV_MESSAGE, 0, 0);
-	}
-}
-
-DISPATCH_NOINLINE
-static void
-_dispatch_mach_kevent_portset_drain(dispatch_kevent_t ke)
-{
-	if (ke->ident == _dispatch_mach_recv_portset) {
-		return _dispatch_kevent_mach_msg_drain(ke);
-	} else {
-		dispatch_assert(ke->ident == _dispatch_mach_portset);
-		return _dispatch_mach_kevent_portset_merge(ke);
-	}
-}
-#endif // DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-
 static void
 _dispatch_kevent_mach_msg_recv(dispatch_unote_t du, uint32_t flags,
 		mach_msg_header_t *hdr)
@@ -2119,11 +2047,6 @@ _dispatch_kevent_mach_msg_recv(dispatch_unote_t du, uint32_t flags,
 				"received message with MACH_PORT_NULL port");
 	} else {
 		_dispatch_debug_machport(name);
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-		if (du._du == NULL) {
-			du = _dispatch_mach_kevent_mach_recv_direct_find(name);
-		}
-#endif
 		if (likely(du._du)) {
 			return dux_merge_msg(du._du, flags, hdr, siz);
 		}
@@ -2194,25 +2117,6 @@ out:
 		_dispatch_bug_mach_client("_dispatch_kevent_mach_msg_drain: "
 				"message reception failed", kr);
 	}
-
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-	if (!(flags & EV_UDATA_SPECIFIC)) {
-		_dispatch_kq_deferred_update(DISPATCH_WLH_GLOBAL,
-				&_dispatch_mach_recv_kevent);
-	}
-#endif
-}
-
-static dispatch_unote_t
-_dispatch_source_mach_recv_create(dispatch_source_type_t dst,
-		uintptr_t handle, unsigned long mask)
-{
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-	if (!_dispatch_evfilt_machport_direct_enabled) {
-		dst = &_dispatch_source_type_mach_recv_pset;
-	}
-#endif
-	return _dispatch_unote_create_with_handle(dst, handle, mask);
 }
 
 const dispatch_source_type_s _dispatch_source_type_mach_recv = {
@@ -2222,25 +2126,12 @@ const dispatch_source_type_s _dispatch_source_type_mach_recv = {
 	.dst_fflags     = 0,
 	.dst_size       = sizeof(struct dispatch_source_refs_s),
 
-	.dst_create     = _dispatch_source_mach_recv_create,
+	.dst_create     = _dispatch_unote_create_with_handle,
 	.dst_merge_evt  = _dispatch_source_merge_evt,
 	.dst_merge_msg  = NULL, // never receives messages directly
-};
 
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-const dispatch_source_type_s _dispatch_source_type_mach_recv_pset = {
-	.dst_kind       = "mach_recv (portset)",
-	.dst_filter     = EVFILT_MACHPORT,
-	.dst_flags      = EV_DISPATCH,
-	.dst_fflags     = 0,
-	.dst_size       = sizeof(struct dispatch_source_refs_s),
-
-	.dst_create     = NULL, // never created directly
-	.dst_update_mux = _dispatch_mach_recv_update_portset_mux,
-	.dst_merge_evt  = _dispatch_source_merge_evt,
-	.dst_merge_msg  = NULL, // never receives messages directly
+	.dst_per_trigger_qos = true,
 };
-#endif
 
 static void
 _dispatch_source_mach_recv_direct_merge_msg(dispatch_unote_t du, uint32_t flags,
@@ -2266,18 +2157,6 @@ _dispatch_source_mach_recv_direct_merge_msg(dispatch_unote_t du, uint32_t flags,
 	}
 }
 
-static dispatch_unote_t
-_dispatch_source_mach_recv_direct_create(dispatch_source_type_t dst,
-	uintptr_t handle, unsigned long mask)
-{
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-	if (!_dispatch_evfilt_machport_direct_enabled) {
-		dst = &_dispatch_source_type_mach_recv_direct_pset;
-	}
-#endif
-	return _dispatch_unote_create_with_handle(dst, handle, mask);
-}
-
 static void
 _dispatch_mach_recv_direct_merge(dispatch_unote_t du,
 		uint32_t flags, uintptr_t data,
@@ -2298,39 +2177,12 @@ const dispatch_source_type_s _dispatch_source_type_mach_recv_direct = {
 	.dst_fflags     = DISPATCH_MACH_RCV_OPTIONS,
 	.dst_size       = sizeof(struct dispatch_source_refs_s),
 
-	.dst_create     = _dispatch_source_mach_recv_direct_create,
+	.dst_create     = _dispatch_unote_create_with_handle,
 	.dst_merge_evt  = _dispatch_mach_recv_direct_merge,
 	.dst_merge_msg  = _dispatch_source_mach_recv_direct_merge_msg,
+
+	.dst_per_trigger_qos = true,
 };
-
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-const dispatch_source_type_s _dispatch_source_type_mach_recv_direct_pset = {
-	.dst_kind       = "direct mach_recv (portset)",
-	.dst_filter     = EVFILT_MACHPORT,
-	.dst_flags      = 0,
-	.dst_fflags     = DISPATCH_MACH_RCV_OPTIONS,
-	.dst_size       = sizeof(struct dispatch_source_refs_s),
-
-	.dst_create     = NULL, // never created directly
-	.dst_update_mux = _dispatch_mach_recv_direct_update_portset_mux,
-	.dst_merge_evt  = _dispatch_mach_recv_direct_merge,
-	.dst_merge_msg  = _dispatch_source_mach_recv_direct_merge_msg,
-};
-#endif
-
-static dispatch_unote_t
-_dispatch_mach_recv_create(dispatch_source_type_t dst,
-	uintptr_t handle, unsigned long mask)
-{
-	// mach channels pass MACH_PORT_NULL until connect
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-	if (!_dispatch_evfilt_machport_direct_enabled) {
-		dst = &_dispatch_mach_type_recv_pset;
-	}
-#endif
-	// without handle because the mach code will set the ident later
-	return _dispatch_unote_create_without_handle(dst, handle, mask);
-}
 
 const dispatch_source_type_s _dispatch_mach_type_recv = {
 	.dst_kind       = "mach_recv (channel)",
@@ -2339,37 +2191,13 @@ const dispatch_source_type_s _dispatch_mach_type_recv = {
 	.dst_fflags     = DISPATCH_MACH_RCV_OPTIONS,
 	.dst_size       = sizeof(struct dispatch_mach_recv_refs_s),
 
-	.dst_create     = _dispatch_mach_recv_create,
+	 // without handle because the mach code will set the ident after connect
+	.dst_create     = _dispatch_unote_create_without_handle,
 	.dst_merge_evt  = _dispatch_mach_recv_direct_merge,
 	.dst_merge_msg  = _dispatch_mach_merge_msg,
+
+	.dst_per_trigger_qos = true,
 };
-
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-const dispatch_source_type_s _dispatch_mach_type_recv_pset = {
-	.dst_kind       = "mach_recv (channel, portset)",
-	.dst_filter     = EVFILT_MACHPORT,
-	.dst_flags      = 0,
-	.dst_fflags     = DISPATCH_MACH_RCV_OPTIONS,
-	.dst_size       = sizeof(struct dispatch_mach_recv_refs_s),
-
-	.dst_create     = NULL, // never created directly
-	.dst_update_mux = _dispatch_mach_recv_direct_update_portset_mux,
-	.dst_merge_evt  = _dispatch_mach_recv_direct_merge,
-	.dst_merge_msg  = _dispatch_mach_merge_msg,
-};
-#endif
-
-static dispatch_unote_t
-_dispatch_mach_reply_create(dispatch_source_type_t dst,
-	uintptr_t handle, unsigned long mask)
-{
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-	if (!_dispatch_evfilt_machport_direct_enabled) {
-		dst = &_dispatch_mach_type_reply_pset;
-	}
-#endif
-	return _dispatch_unote_create_with_handle(dst, handle, mask);
-}
 
 DISPATCH_NORETURN
 static void
@@ -2388,25 +2216,10 @@ const dispatch_source_type_s _dispatch_mach_type_reply = {
 	.dst_fflags     = DISPATCH_MACH_RCV_OPTIONS,
 	.dst_size       = sizeof(struct dispatch_mach_reply_refs_s),
 
-	.dst_create     = _dispatch_mach_reply_create,
+	.dst_create     = _dispatch_unote_create_with_handle,
 	.dst_merge_evt  = _dispatch_mach_reply_merge_evt,
 	.dst_merge_msg  = _dispatch_mach_reply_merge_msg,
 };
-
-#if DISPATCH_EVFILT_MACHPORT_PORTSET_FALLBACK
-const dispatch_source_type_s _dispatch_mach_type_reply_pset = {
-	.dst_kind       = "mach reply (portset)",
-	.dst_filter     = EVFILT_MACHPORT,
-	.dst_flags      = EV_ONESHOT,
-	.dst_fflags     = DISPATCH_MACH_RCV_OPTIONS,
-	.dst_size       = sizeof(struct dispatch_mach_reply_refs_s),
-
-	.dst_create     = NULL, // never created directly
-	.dst_update_mux = _dispatch_mach_recv_direct_update_portset_mux,
-	.dst_merge_evt  = _dispatch_mach_reply_merge_evt,
-	.dst_merge_msg  = _dispatch_mach_reply_merge_msg,
-};
-#endif
 
 #pragma mark Mach channel SIGTERM notification (for XPC channels only)
 

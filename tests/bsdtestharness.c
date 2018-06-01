@@ -23,7 +23,9 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <signal.h>
 #ifdef __APPLE__
 #include <mach/clock_types.h>
@@ -31,7 +33,7 @@
 #endif
 #include <sys/resource.h>
 #include <sys/time.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 #include <sys/wait.h>
 #endif
 
@@ -93,7 +95,7 @@ main(int argc, char *argv[])
 
 #endif
 	int i;
-	char** newargv = calloc(argc, sizeof(void*));
+	char** newargv = calloc((size_t)argc, sizeof(void*));
 	for (i = 1; i < argc; ++i) {
 		newargv[i-1] = argv[i];
 	}
@@ -128,6 +130,7 @@ main(int argc, char *argv[])
 	tv_wall.tv_usec = labs(tv_stop.tv_usec - tv_start.tv_usec);
 
 	int res2 = wait4(pid, &status, 0, &usage);
+	(void)res2;
 	assert(res2 != -1);
 	test_long("Process exited", (WIFEXITED(status) && WEXITSTATUS(status) && WEXITSTATUS(status) != 0xff) || WIFSIGNALED(status), 0);
 	printf("[PERF]\twall time: %ld.%06ld\n", tv_wall.tv_sec, tv_wall.tv_usec);

@@ -21,6 +21,18 @@
 #ifndef __BSD_TEST_H__
 #define __BSD_TEST_H__
 
+
+#if !HAVE_PRINTFLIKE
+#ifndef __printflike
+#if __has_attribute(format)
+#define __printflike(a,b) __attribute__((format(printf, a, b)))
+#else
+#define __printflike(a,b)
+#endif // __has_attribute(format)
+#endif // !defined(__printflike)
+#endif // !HAVE_PRINTFLIKE
+
+
 #include <errno.h>
 #ifdef __APPLE__
 #include <mach/error.h>
@@ -29,7 +41,11 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <unistd.h>
+#endif
 #include <string.h>
+#include <stdint.h>
 
 static inline const char*
 __BASENAME__(const char *_str_)
@@ -81,15 +97,19 @@ void test_ptr_format(const void* actual, const void* expected, const char *forma
 
 void _test_uint32(const char* file, long line, const char* desc, uint32_t actual, uint32_t expected);
 #define test_uint32(a,b,c) _test_uint32(__SOURCE_FILE__, __LINE__, a, b, c)
-void test_uint32_format(long actual, long expected, const char *format, ...) __printflike(3,4);
+void test_uint32_format(uint32_t actual, uint32_t expected, const char *format, ...) __printflike(3,4);
 
 void _test_int32(const char* file, long line, const char* desc, int32_t actual, int32_t expected);
 #define test_int32(a,b,c) _test_int32(__SOURCE_FILE__, __LINE__, a, b, c)
-void test_sint32_format(int32_t actual, int32_t expected, const char* format, ...) __printflike(3,4);
+void test_int32_format(int32_t actual, int32_t expected, const char* format, ...) __printflike(3,4);
 
 void _test_long(const char* file, long line, const char* desc, long actual, long expected);
 #define test_long(a,b,c) _test_long(__SOURCE_FILE__, __LINE__, a, b, c)
 void test_long_format(long actual, long expected, const char *format, ...) __printflike(3,4);
+
+void _test_sizet(const char* file, long line, const char* desc, size_t actual, size_t expected);
+#define test_sizet(a,b,c) _test_sizet(__SOURCE_FILE__, __LINE__, a, b, c)
+void test_sizet_format(size_t actual, size_t expected, const char *format, ...) __printflike(3,4);
 
 void _test_uint64(const char* file, long line, const char* desc, uint64_t actual, uint64_t expected);
 #define test_uint64(a,b,c) _test_uint64(__SOURCE_FILE__, __LINE__, a, b, c)
@@ -111,6 +131,14 @@ void _test_long_greater_than_or_equal(const char* file, long line, const char* d
 #define test_long_greater_than_or_equal(a,b,c) _test_long_greater_than_or_equal(__SOURCE_FILE__, __LINE__, a, b, c)
 void test_long_greater_than_or_equal_format(long actual, long expected_min, const char *format, ...) __printflike(3,4);
 
+void _test_sizet_less_than(const char* file, long line, const char* desc, size_t actual, size_t max_expected);
+#define test_sizet_less_than(a,b,c) _test_sizet_less_than(__SOURCE_FILE__, __LINE__, a, b, c)
+void test_sizet_less_than_format(size_t actual, size_t max_expected, const char *format, ...) __printflike(3,4);
+
+void _test_sizet_less_than_or_equal(const char* file, long line, const char* desc, size_t actual, size_t max_expected);
+#define test_sizet_less_than_or_equal(a,b,c) _test_sizet_less_than_or_equal(__SOURCE_FILE__, __LINE__, a, b, c)
+void test_sizet_less_than_or_equal_format(size_t actual, size_t max_expected, const char *format, ...) __printflike(3,4);
+
 void _test_double_less_than_or_equal(const char* file, long line, const char* desc, double val, double max_expected);
 #define test_double_less_than_or_equal(d, v, m) _test_double_less_than_or_equal(__SOURCE_FILE__, __LINE__, d, v, m)
 void test_double_less_than_or_equal_format(double val, double max_expected, const char *format, ...) __printflike(3,4);
@@ -123,11 +151,11 @@ void _test_double_equal(const char* file, long line, const char* desc, double va
 #define test_double_equal(d, v, m) _test_double_equal(__SOURCE_FILE__, __LINE__, d, v, m)
 void test_double_equal_format(double val, double expected, const char *format, ...) __printflike(3,4);
 
-void _test_errno(const char* file, long line, const char* desc, long actual, long expected);
+void _test_errno(const char* file, long line, const char* desc, int actual, int expected);
 #define test_errno(a,b,c) _test_errno(__SOURCE_FILE__, __LINE__, a, b, c)
-void test_errno_format(long actual, long expected, const char *format, ...) __printflike(3,4);
+void test_errno_format(int actual, int expected, const char *format, ...) __printflike(3,4);
 
-#ifndef __linux__
+#if defined(__APPLE__)
 void _test_mach_error(const char* file, long line, const char* desc, mach_error_t actual, mach_error_t expected);
 #define test_mach_error(a,b,c) _test_mach_error(__SOURCE_FILE__, __LINE__, a, b, c)
 void test_mach_error_format(mach_error_t actual, mach_error_t expected, const char *format, ...) __printflike(3,4);

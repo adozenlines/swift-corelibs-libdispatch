@@ -14,11 +14,12 @@ install(FILES
           source.h
           time.h
         DESTINATION
-          ${CMAKE_INSTALL_FULL_INCLUDEDIR}/dispatch/)
+          "${INSTALL_DISPATCH_HEADERS_DIR}")
 if(ENABLE_SWIFT)
+  get_filename_component(MODULE_MAP module.modulemap REALPATH)
   install(FILES
-            module.modulemap
+            ${MODULE_MAP}
           DESTINATION
-            ${CMAKE_INSTALL_FULL_INCLUEDIR}/dispatch/)
+            "${INSTALL_DISPATCH_HEADERS_DIR}")
 endif()
 

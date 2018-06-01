@@ -19,7 +19,9 @@
  */
 
 #include <dispatch/dispatch.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,8 +45,8 @@
 
 static void test_group_notify(void*);
 
-dispatch_group_t
-create_group(size_t count, int delay)
+static dispatch_group_t
+create_group(size_t count, unsigned int delay)
 {
 	size_t i;
 
@@ -126,7 +128,11 @@ test_group_notify2(long cycle, dispatch_group_t tested)
 
 	// n=4 works great for a 4CPU Mac Pro, this might work for a wider range of
 	// systems.
+#if HAVE_ARC4RANDOM
 	const int n = 1 + arc4random() % 8;
+#else
+    const int n = 1 + random() % 8;
+#endif
 	dispatch_group_t group = dispatch_group_create();
 	dispatch_queue_t qa[n];
 
@@ -143,7 +149,8 @@ test_group_notify2(long cycle, dispatch_group_t tested)
 		dispatch_group_async(group, q, ^{
 			// Seems to trigger a little more reliably with some work being
 			// done in this block
-			eh = sin(M_1_PI / cycle);
+			assert(cycle && "cycle must be non-zero");
+			eh = (float)sin(M_1_PI / cycle);
 		});
 	}
 	dispatch_group_leave(group);
@@ -171,9 +178,9 @@ test_group_notify(void *ctxt __attribute__((unused)))
 	dispatch_group_t tested = dispatch_group_create();
 	test_ptr_notnull("dispatch_group_create", tested);
 	long i;
-	for (i = 0; i < LOOP_COUNT; i++) {
-		if (!((i+1) % (LOOP_COUNT/10))) {
-			fprintf(stderr, "#%ld\n", i+1);
+	for (i = 1; i <= LOOP_COUNT; i++) {
+		if (!(i % (LOOP_COUNT/10))) {
+			fprintf(stderr, "#%ld\n", i);
 		}
 		dispatch_group_enter(tested);
 		test_group_notify2(i, tested);
@@ -182,7 +189,7 @@ test_group_notify(void *ctxt __attribute__((unused)))
 			break;
 		}
 	}
-	test_long("dispatch_group_notify", i, LOOP_COUNT);
+	test_long("dispatch_group_notify", i - 1, LOOP_COUNT);
 	test_stop();
 }
 

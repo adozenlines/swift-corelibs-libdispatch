@@ -26,7 +26,7 @@
 #include <mach/mach_time.h>
 #include <firehose/tracepoint_private.h>
 #endif
-#ifndef __linux__
+#if __APPLE__
 #include <os/base.h>
 #include <os/availability.h>
 #endif
@@ -282,12 +282,13 @@ voucher_activity_trace_with_private_strings(firehose_stream_t stream,
 		const void *privdata, size_t privlen);
 
 typedef const struct voucher_activity_hooks_s {
-#define VOUCHER_ACTIVITY_HOOKS_VERSION     4
+#define VOUCHER_ACTIVITY_HOOKS_VERSION     5
 	long vah_version;
 	mach_port_t (*vah_get_logd_port)(void);
 	dispatch_mach_handler_function_t vah_debug_channel_handler;
 	kern_return_t (*vah_get_reconnect_info)(mach_vm_address_t *, mach_vm_size_t *);
 	void (*vah_metadata_init)(void *metadata_buffer, size_t size);
+	void (*vah_quarantine_starts)(void);
 } *voucher_activity_hooks_t;
 
 /*!
